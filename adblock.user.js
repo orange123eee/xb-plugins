@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         广告拦截 · AdBlock Lite
 // @namespace    local.xbrowser.adblock
-// @version      1.2.0
+// @version      1.3.0
 // @description  拦截广告与追踪请求、清理广告元素、隐藏广告位，支持 YouTube 广告跳过。轻量、无规则订阅、不吃内存。
 // @author       me
 // @match        *://*/*
@@ -14,7 +14,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '1.2.0';
+  var VERSION = '1.3.0';
   var HOST = location.hostname.toLowerCase();
 
   // 已经跑过就别重复注入（有些站会二次执行）
@@ -50,6 +50,8 @@
     // missav 这类站实测用到的
     'snaptrckr.fun', 'rallytrck.website', 'mayzaent.com', 'mavrtracktor.com',
     'googletagmanager.com', 'googletagservices.com',
+    // 联盟/导流链接（同时按资源拦）
+    'bit.ly', 'mycomic.com', 'jerkdolls.com', 'theporndude.com', 'myavlive.com',
     // 统计 / 追踪
     'scorecardresearch.com', 'quantserve.com', 'hotjar.com', 'mouseflow.com',
     'fullstory.com', 'smartlook.com', 'clarity.ms', 'branch.io',
@@ -205,6 +207,36 @@
     }
   }
 
+  // 这些域名的 <a> 链接直接藏掉（联盟导流广告，点了就跳走）
+  var LINK_HOSTS = ['bit.ly', 'mycomic.com', 'jerkdolls.com', 'theporndude.com', 'myavlive.com'];
+  var LRE = new RegExp('(^|\\.)(' + LINK_HOSTS.map(function (d) {
+    return d.replace(/\./g, '\\.');
+  }).join('|') + ')$', 'i');
+
+  function linkBlocked(href) {
+    if (!href) return false;
+    var h;
+    try { h = new URL(href, location.href).hostname.toLowerCase(); } catch (e) { return false; }
+    return !!h && LRE.test(h);
+  }
+
+  function hideAdLink(a) {
+    if (!a || a.tagName !== 'A' || a.__xbAbLink) return false;
+    var href = a.getAttribute('href');
+    if (!linkBlocked(href)) return false;
+    a.__xbAbLink = true;
+    try { a.style.setProperty('display', 'none', 'important'); } catch (e) {}
+    stat.el++;
+    return true;
+  }
+
+  function scanLinks(root) {
+    if (!root || !root.querySelectorAll) return;
+    var list;
+    try { list = root.querySelectorAll('a[href]'); } catch (e) { return; }
+    for (var i = 0; i < list.length; i++) hideAdLink(list[i]);
+  }
+
   function sweep(root) {
     if (!root || !root.querySelectorAll) return;
     // 先摘掉 src 命中黑名单的元素（含 HTML 里写死的 iframe/script）
@@ -222,6 +254,8 @@
       try { el.style.setProperty('display', 'none', 'important'); } catch (e) {}
       stat.el++;
     }
+
+    scanLinks(root);
   }
 
   // 动态插入的广告靠这个抓
@@ -235,6 +269,7 @@
           var n = added[j];
           if (n.nodeType !== 1) continue;
           if (nukeIfAd(n)) continue;                    // 广告元素直接摘掉
+          if (n.tagName === 'A') hideAdLink(n);         // 广告链接
           if (n.matches && n.matches(AD_SEL)) {
             n.style.setProperty('display', 'none', 'important');
             stat.el++;
@@ -514,6 +549,17 @@
     startObserver();
     sweep(document.documentElement);
   });
+
+  // 兜底：万一链接没被藏掉（比如页面自己又加回来），点击也拦一下
+  document.addEventListener('click', function (e) {
+    var t = e.target;
+    while (t && t.nodeType === 1 && t.tagName !== 'A') t = t.parentNode;
+    if (t && t.tagName === 'A' && linkBlocked(t.getAttribute('href'))) {
+      e.preventDefault();
+      e.stopPropagation();
+      stat.el++;
+    }
+  }, true);
 
   document.addEventListener('DOMContentLoaded', function () {
     cleanDead();

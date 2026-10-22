@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         广告拦截 · AdBlock Lite
 // @namespace    local.xbrowser.adblock
-// @version      1.1.0
+// @version      1.2.0
 // @description  拦截广告与追踪请求、清理广告元素、隐藏广告位，支持 YouTube 广告跳过。轻量、无规则订阅、不吃内存。
 // @author       me
 // @match        *://*/*
@@ -14,7 +14,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '1.1.0';
+  var VERSION = '1.2.0';
   var HOST = location.hostname.toLowerCase();
 
   // 已经跑过就别重复注入（有些站会二次执行）
@@ -47,6 +47,9 @@
     'onclickalgo.com', 'onclickmega.com', 'onclckmn.com', 'tsyndicate.net',
     'creative-sb1.com', 'creative-bcf.com', 'a.magsrv.com', 'syndication.exdynsrv.com',
     'juicyads.net', 'js.juicyads.com', 'puhtml.com', 'adnium.net', 'cams.gratis',
+    // missav 这类站实测用到的
+    'snaptrckr.fun', 'rallytrck.website', 'mayzaent.com', 'mavrtracktor.com',
+    'googletagmanager.com', 'googletagservices.com',
     // 统计 / 追踪
     'scorecardresearch.com', 'quantserve.com', 'hotjar.com', 'mouseflow.com',
     'fullstory.com', 'smartlook.com', 'clarity.ms', 'branch.io',
@@ -165,8 +168,50 @@
   ];
   var AD_SEL = AD_SELECTORS.join(',');
 
+  // 让广告元素失效。注意：HTML 还在解析时不能直接 removeChild ——
+  // 解析器的插入点会指向已摘除的节点，导致后面整段内容被吞掉（踩过）
+  function nukeIfAd(n) {
+    if (!n || n.nodeType !== 1) return false;
+    var tag = n.tagName;
+    if (tag !== 'IFRAME' && tag !== 'SCRIPT' && tag !== 'IMG' && tag !== 'EMBED' &&
+        tag !== 'OBJECT' && tag !== 'LINK' && tag !== 'SOURCE') return false;
+    var src = n.getAttribute && (n.getAttribute('src') || n.getAttribute('data') || n.getAttribute('href'));
+    if (!src || !isBlocked(src)) return false;
+    bump('req', src);
+
+    try {
+      if (document.readyState === 'loading') {
+        // 解析中：先"废掉"，等 DOMContentLoaded 再真删
+        n.__xbAbDead = true;
+        if (tag === 'SCRIPT') n.setAttribute('type', 'javascript/blocked');
+        else if (tag === 'IFRAME') n.setAttribute('src', 'about:blank');
+        else n.removeAttribute('src');
+        n.style.setProperty('display', 'none', 'important');
+      } else if (n.parentNode) {
+        n.parentNode.removeChild(n);
+      }
+    } catch (e) {}
+    return true;
+  }
+
+  // 解析完成后，把标记过的一次性清掉
+  function cleanDead() {
+    var dead;
+    try { dead = document.querySelectorAll('iframe,script,img,embed,object,link,source'); } catch (e) { return; }
+    for (var i = 0; i < dead.length; i++) {
+      if (dead[i].__xbAbDead) {
+        try { if (dead[i].parentNode) dead[i].parentNode.removeChild(dead[i]); } catch (e) {}
+      }
+    }
+  }
+
   function sweep(root) {
     if (!root || !root.querySelectorAll) return;
+    // 先摘掉 src 命中黑名单的元素（含 HTML 里写死的 iframe/script）
+    var bad;
+    try { bad = root.querySelectorAll('iframe[src],script[src],img[src],embed[src],object[data],source[src]'); } catch (e) { bad = []; }
+    for (var b = 0; b < bad.length; b++) nukeIfAd(bad[b]);
+
     var list;
     try { list = root.querySelectorAll(AD_SEL); } catch (e) { return; }
     for (var i = 0; i < list.length; i++) {
@@ -189,6 +234,7 @@
         for (var j = 0; j < added.length; j++) {
           var n = added[j];
           if (n.nodeType !== 1) continue;
+          if (nukeIfAd(n)) continue;                    // 广告元素直接摘掉
           if (n.matches && n.matches(AD_SEL)) {
             n.style.setProperty('display', 'none', 'important');
             stat.el++;
@@ -470,9 +516,11 @@
   });
 
   document.addEventListener('DOMContentLoaded', function () {
+    cleanDead();
     sweep(document);
     if (isYT) setInterval(ytTick, 600);
   });
+  window.addEventListener('load', function () { cleanDead(); });
 
   // 徽标上的数字保持最新
   setInterval(refreshBadge, 1200);

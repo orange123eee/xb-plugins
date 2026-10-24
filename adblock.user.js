@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         广告拦截 · AdBlock Lite
 // @namespace    local.xbrowser.adblock
-// @version      2.0.0
+// @version      2.0.1
 // @description  拦截广告/追踪请求、popunder 弹窗与广告元素；YouTube 接口级去广。内置精简规则，不订阅外部列表。
 // @author       me
 // @match        *://*/*
@@ -20,7 +20,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '2.0.0';
+  var VERSION = '2.0.1';
   var HOST = location.hostname.toLowerCase();
 
   if (window.__xbAdblock) return;
@@ -68,7 +68,7 @@
     'creative-sb1.com', 'creative-bcf.com', 'puhtml.com', 'cams.gratis',
     // 真实站点里见到的
     'snaptrckr.fun', 'rallytrck.website', 'mayzaent.com', 'mavrtracktor.com',
-    'myavlive.com', 'mycomic.com', 'jerkdolls.com', 'theporndude.com', 'bit.ly',
+    'myavlive.com', 'mycomic.com', 'jerkdolls.com', 'theporndude.com',
     // 统计 / 追踪
     'google-analytics.com', 'analytics.google.com',
     'scorecardresearch.com', 'quantserve.com', 'hotjar.com', 'mouseflow.com',
@@ -87,7 +87,9 @@
   var ALLOW_HOSTS = [];
 
   // 联盟导流链接：不一定作为资源加载，但点了会跳出站外
-  var LINK_HOSTS = ['bit.ly', 'mycomic.com', 'jerkdolls.com', 'theporndude.com', 'myavlive.com'];
+  // 注意：bit.ly 这类通用短链不放进来（大量正常内容在用），
+  // 恶意短链由 popupWrapper 的"包装跳转 + 第三方"判断兜底
+  var LINK_HOSTS = ['mycomic.com', 'jerkdolls.com', 'theporndude.com', 'myavlive.com'];
 
   var HOST_MAP = Object.create(null);
   var ALLOW_MAP = Object.create(null);
@@ -478,7 +480,14 @@
         enumerable: d.enumerable,
         get: d.get,
         set: function (v) {
-          if (isBlocked(v, type || 'other')) { bump('el', v); return; }
+          if (isBlocked(v, type || 'other')) {
+            bump('el', v);
+            // 图片被拦后留着空 src 会显示破图图标，顺手藏掉
+            if (type === 'image' && this.style) {
+              try { this.style.setProperty('display', 'none', 'important'); } catch (e) {}
+            }
+            return;
+          }
           return d.set.call(this, v);
         }
       });
@@ -549,7 +558,8 @@
       toString: function () { return 'about:blank'; }
     };
     return {
-      closed: true, name: '', opener: null,
+      // closed 必须是 false：popunder 脚本看到窗口"已关闭"会立刻重开，形成死循环
+      closed: false, name: '', opener: null,
       document: doc, location: loc,
       focus: function () {}, blur: function () {}, close: function () {},
       postMessage: function () {}, moveTo: function () {}, resizeTo: function () {},
@@ -635,6 +645,9 @@
         if (n.tagName === 'SCRIPT') n.setAttribute('type', 'javascript/blocked');
         else if (n.tagName === 'IFRAME') n.setAttribute('src', 'about:blank');
         else if (blockedSet && n.removeAttribute) n.removeAttribute('srcset');
+        // 按元素实际使用的属性删，否则广告照样加载
+        else if (n.tagName === 'OBJECT' && n.removeAttribute) n.removeAttribute('data');
+        else if (n.tagName === 'LINK' && n.removeAttribute) n.removeAttribute('href');
         else if (n.removeAttribute) n.removeAttribute('src');
         n.style.setProperty('display', 'none', 'important');
       } else if (n.parentNode) {
@@ -741,7 +754,6 @@
       s.setAttribute('data-xb-ab', '1');
       s.textContent = CSS_TEXT;
       parent.appendChild(s);
-      if (isDoc) stat.css = 1;
       return true;
     } catch (e) { return false; }
   }
@@ -763,6 +775,7 @@
   // 抓动态插入的广告；批量处理，避免每个节点都跑全量 querySelectorAll
   var pendingRoots = [];
   var pendingTimer = 0;
+  var cssFlushCount = 0;
 
   function observeRoot(root) {
     if (!root || root.__xbAbObserved) return;
@@ -807,7 +820,9 @@
     pendingTimer = 0;
     var roots = pendingRoots;
     pendingRoots = [];
-    if (!roots.length) { ensureAllCss(); return; }
+    // 全量补样式要遍历所有 shadow root，分频执行（DOMContentLoaded/load 时也会补）
+    var wantCss = (++cssFlushCount & 7) === 0;
+    if (!roots.length) { if (wantCss) ensureAllCss(); return; }
 
     // 去掉被其他待扫节点包含的，减少重复扫描
     var list = [];
@@ -823,7 +838,7 @@
     for (var k = 0; k < list.length; k++) {
       try { if (list[k].isConnected !== false) sweep(list[k]); } catch (e) {}
     }
-    ensureAllCss();
+    if (wantCss) ensureAllCss();
   }
 
   // attachShadow 钩子：open/closed 都能拿到 root，样式和 observer 一次装好
@@ -832,6 +847,7 @@
     var _attach = Element.prototype.attachShadow;
     Element.prototype.attachShadow = function () {
       var root = _attach.apply(this, arguments);
+      if (buildingBadge) return root;   // 我们自己的徽标不用处理
       try {
         injectCssInto(root);
         if (shadowObserved < 100) {
@@ -850,6 +866,30 @@
    * ------------------------------------------------------------------ */
 
   var isYT = /(^|\.)youtube\.com$|(^|\.)youtube-nocookie\.com$|(^|\.)youtu\.be$/.test(HOST);
+
+  // 首次加载的广告在内联 JSON（window.ytInitialPlayerResponse）里，fetch 钩子拦不到：
+  // 本脚本跑在 document-start，给这个属性装个 setter 陷阱，
+  // 页面内联脚本赋值的一瞬间就裁掉广告字段，播放器读到的已是干净数据
+  if (isYT) {
+    try {
+      var ytPrVal = window.ytInitialPlayerResponse;
+      Object.defineProperty(window, 'ytInitialPlayerResponse', {
+        configurable: true,
+        enumerable: true,
+        get: function () { return ytPrVal; },
+        set: function (v) {
+          try {
+            if (v && typeof v === 'object' && pruneYouTubeAds(v, 0)) {
+              stat.ytapi++;
+              maybeShowBadge();
+            }
+          } catch (e) {}
+          ytPrVal = v;
+        }
+      });
+    } catch (e) {}
+  }
+
   var ytWasAd = false, ytRate = 1, ytMuted = false, ytCounted = false;
 
   function hideYtOverlays(player) {
@@ -917,7 +957,8 @@
    *  5. 徽标 / 面板
    * ------------------------------------------------------------------ */
 
-  var badgeEl = null, badgeTimer = 0, badgeShown = false, badgeWait = 0;
+  var badgeEl = null, badgeTimer = 0, badgeShown = false, badgeWait = 0, badgeTick = 0;
+  var buildingBadge = false;   // 自家徽标的 shadow root 不用注入广告 CSS / observer
 
   function maybeShowBadge() {
     if (badgeShown) return;
@@ -940,7 +981,10 @@
     host.id = '__xb_ab_badge__';
     host.style.cssText = 'position:fixed;left:10px;bottom:14px;z-index:2147483000;font:12px/1 -apple-system,"PingFang SC",sans-serif;';
 
-    var root = host.attachShadow ? host.attachShadow({ mode: 'open' }) : host;
+    var root;
+    buildingBadge = true;
+    try { root = host.attachShadow ? host.attachShadow({ mode: 'open' }) : host; }
+    finally { buildingBadge = false; }
 
     var pill = document.createElement('div');
     pill.style.cssText = [
@@ -988,6 +1032,8 @@
 
   function hideBadge() {
     if (!badgeEl) return;
+    clearInterval(badgeTick);   // 徽标没了就别再空转刷新
+    badgeTick = 0;
     badgeEl.pill.style.opacity = '0';
     setTimeout(function () {
       if (badgeEl && badgeEl.host && badgeEl.host.parentNode) {
@@ -1175,7 +1221,7 @@
   });
 
   // 徽标上的数字保持最新
-  setInterval(refreshBadge, 1200);
+  badgeTick = setInterval(refreshBadge, 1200);
 
   window.__ab.enableLog = function (on) { window.__abLog = !!on; };
   window.__ab.sweep = sweep;

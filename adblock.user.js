@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         广告拦截 · AdBlock Lite
 // @namespace    local.xbrowser.adblock
-// @version      2.2.1
+// @version      2.2.2
 // @description  拦截广告/追踪请求、popunder 弹窗与广告元素；广告库假加载骗过反拦截检测；通用"跳过广告"自动点；YouTube 接口级去广。内置精简规则，不订阅外部列表。
 // @author       me
 // @match        *://*/*
 // @run-at       document-start
 // @grant        none
-// @updateURL    https://orange123eee.github.io/xb-video-kit/adblock.user.js
-// @downloadURL  https://orange123eee.github.io/xb-video-kit/adblock.user.js
+// @updateURL    https://orange123eee.github.io/xb-plugins/adblock.user.js
+// @downloadURL  https://orange123eee.github.io/xb-plugins/adblock.user.js
 // ==/UserScript==
 
 // 思路与规则来源（只借鉴方法，不打包它们的完整列表）：
@@ -20,7 +20,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '2.2.1';
+  var VERSION = '2.2.2';
   var HOST = location.hostname.toLowerCase();
 
   if (window.__xbAdblock) return;

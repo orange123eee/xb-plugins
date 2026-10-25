@@ -3,75 +3,106 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>我的浏览器插件</title>
+<title>X浏览器插件集 · 安装与更新</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
-  body { margin:0; padding:26px 16px 60px; background:#0f1115; color:#e6e9ef;
-    font:15px/1.65 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
-  .wrap { max-width:620px; margin:0 auto; }
-  h1 { font-size:20px; margin:0 0 4px; }
-  .sub { color:#8b93a1; font-size:13px; margin-bottom:22px; }
-  .card { background:#171a20; border:1px solid #232833; border-radius:14px; padding:16px 16px 14px; margin-bottom:12px; }
-  .row { display:flex; align-items:center; gap:10px; margin-bottom:2px; }
-  .ic { width:38px; height:38px; border-radius:10px; display:flex; align-items:center; justify-content:center;
-    font-size:19px; flex:none; }
-  .t { font-weight:600; font-size:15px; }
-  .d { color:#8b93a1; font-size:12.5px; margin-top:2px; }
-  .ver { font-size:11px; padding:2px 8px; border-radius:20px; background:#1d3a5f; color:#7fbcf5; }
-  a.btn { display:block; text-align:center; text-decoration:none; background:#2f6fd0; color:#fff;
-    font-weight:600; font-size:14px; padding:11px; border-radius:10px; margin-top:12px; }
-  a.btn.ghost { background:#20242c; color:#9fb6d4; font-weight:400; font-size:12.5px; padding:9px; }
-  a.btn:active { opacity:.85; }
-  .tip { color:#77808e; font-size:12px; margin-top:14px; line-height:1.7; }
-  code { background:#0b0d11; padding:1px 5px; border-radius:5px; font-size:12px; }
+  body {
+    margin: 0; padding: 28px 18px 60px;
+    font: 15px/1.65 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #0f1115; color: #e6e9ef;
+  }
+  .wrap { max-width: 620px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #8b93a1; font-size: 13px; margin-bottom: 22px; }
+  .card {
+    background: #171a20; border: 1px solid #232833; border-radius: 14px;
+    padding: 18px; margin-bottom: 14px;
+  }
+  .ver { display: inline-block; font-size: 12px; padding: 2px 9px; border-radius: 20px;
+    background: #1d3a5f; color: #7fbcf5; margin-left: 6px; vertical-align: 2px; }
+  a.btn {
+    display: block; text-align: center; text-decoration: none;
+    background: #2f6fd0; color: #fff; font-weight: 600;
+    padding: 14px; border-radius: 11px; margin: 14px 0 8px;
+  }
+  a.btn:active { background: #2a63ba; }
+  .url {
+    font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace;
+    background: #0b0d11; border: 1px solid #232833; border-radius: 9px;
+    padding: 10px 12px; color: #9fb6d4; word-break: break-all;
+  }
+  ol { padding-left: 20px; margin: 10px 0 0; }
+  li { margin: 7px 0; }
+  .tip { color: #8b93a1; font-size: 12.5px; }
+  code { background: #0b0d11; padding: 1px 5px; border-radius: 5px; font-size: 12.5px; }
+  .k { color: #ffd479; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>我的浏览器插件</h1>
-  <div class="sub">点「安装」直接用 · 更新走脚本内置的更新地址</div>
+  <h1>X浏览器插件集 <span class="ver" id="cnt">3 个</span></h1>
+  <div class="sub">视频提取 · 链接净化 · 广告拦截 ｜ 这里是唯一更新源</div>
 
   <div class="card">
-    <div class="row">
-      <div class="ic" style="background:#3a1d1d">🛡</div>
-      <div style="flex:1">
-        <div class="t">广告拦截 <span class="ver" data-ver="adblock.user.js">v—</span></div>
-        <div class="d">拦广告/追踪请求 · popunder 弹窗 · 广告元素 · YouTube 接口级去广</div>
-      </div>
+    <div style="font-weight:600;margin-bottom:2px">视频提取器 · 万能播放/下载 <span class="ver" id="ver">v—</span></div>
+    <div class="tip" style="margin:4px 0 2px">
+      自动嗅探网页视频（直链 / m3u8 / MSE），内置播放器（手势/倍速/清晰度），
+      站内下载管理（不跳出浏览器、可播放/导出、断点续传）。
     </div>
-    <a class="btn" href="adblock.user.js">安装 / 更新</a>
+    <a class="btn" href="video-extractor.user.js">安装 / 更新 视频提取器</a>
+    <div class="url" id="url">…</div>
   </div>
 
   <div class="card">
-    <div class="row">
-      <div class="ic" style="background:#152b45">🎬</div>
-      <div style="flex:1">
-        <div class="t">视频提取器 <span class="ver" data-ver="https://orange123eee.github.io/xb-video-kit/video-extractor.user.js">v—</span></div>
-        <div class="d">接管网页播放器 · 手势拖动 · 多线程下载合并 MP4</div>
-      </div>
+    <div style="font-weight:600;margin-bottom:2px">链接净化 · 直达 <span class="ver" id="cver">v—</span></div>
+    <div class="tip" style="margin:4px 0 2px">
+      去掉搜索结果 / 分享链接的中转跳转，点击直达目标；百度中转页自动秒跳，不等倒计时。
     </div>
-    <a class="btn" href="https://orange123eee.github.io/xb-video-kit/video-extractor.user.js">安装 / 更新</a>
+    <a class="btn" href="link-cleaner.user.js">安装 / 更新 链接净化</a>
+    <div class="url" id="curl">…</div>
   </div>
 
-  <div class="tip">
-    安装方式：复制按钮对应的地址，在 X浏览器 里
-    <code>菜单 → 脚本 → 从网址安装</code> 粘贴即可。<br>
-    更新：脚本里写了 <code>@updateURL</code>，在脚本管理里点「检查更新」就能拿到新版。
+  <div class="card">
+    <div style="font-weight:600;margin-bottom:2px">广告拦截 · AdBlock Lite <span class="ver" id="aver">v—</span></div>
+    <div class="tip" style="margin:4px 0 2px">
+      拦截广告/追踪请求、弹窗与广告元素；广告库假加载骗过"关拦截器才给看"的检测；
+      通用播放器"跳过广告"自动点。左下角盾牌徽标可看统计 / 复制诊断 / 本站关闭。
+    </div>
+    <a class="btn" href="adblock.user.js">安装 / 更新 广告拦截</a>
+    <div class="url" id="aurl">…</div>
+    <div class="tip" style="margin-top:8px">
+      建议关掉 X浏览器自带的广告拦截，避免两套规则误杀网站。
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="font-weight:600;margin-bottom:6px">以后怎么更新</div>
+    <ol>
+      <li>X浏览器会按脚本里的 <code>@updateURL</code> 定期检查，有新版本会提示。</li>
+      <li>也可以随时回到这个页面，点上面的按钮覆盖安装一次。</li>
+      <li>更新不会丢设置（设置和下载的文件存在本地，跟脚本文件分开）。</li>
+      <li>早先从其他地址（xb-video-kit / 旧 xb-plugins）装过的，点这里装一次就切到本源。</li>
+    </ol>
   </div>
 </div>
 <script>
-  // 版本号直接从脚本文件里读，避免页面和脚本对不上
-  document.querySelectorAll('[data-ver]').forEach(function (el) {
-    var url = el.getAttribute('data-ver');
-    fetch(url, { cache: 'no-store' })
+  var base = location.origin + location.pathname.replace(/[^/]*$/, '');
+  function fill(id, file) {
+    var el = document.getElementById(id);
+    if (el) el.textContent = base + file;
+    fetch(file, { cache: 'no-store' })
       .then(function (r) { return r.text(); })
       .then(function (t) {
         var m = t.match(/@version\s+([\w.\-]+)/);
-        if (m) el.textContent = 'v' + m[1];
+        var vid = id.replace('url', 'ver').replace('curl', 'cver').replace('aurl', 'aver');
+        if (m) document.getElementById(vid).textContent = 'v' + m[1];
       })
       .catch(function () {});
-  });
+  }
+  fill('url', 'video-extractor.user.js');
+  fill('curl', 'link-cleaner.user.js');
+  fill('aurl', 'adblock.user.js');
 </script>
 </body>
 </html>

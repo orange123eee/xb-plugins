@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         广告拦截 · AdBlock Lite
 // @namespace    local.xbrowser.adblock
-// @version      2.0.1
-// @description  拦截广告/追踪请求、popunder 弹窗与广告元素；YouTube 接口级去广。内置精简规则，不订阅外部列表。
+// @version      2.2.1
+// @description  拦截广告/追踪请求、popunder 弹窗与广告元素；广告库假加载骗过反拦截检测；通用"跳过广告"自动点；YouTube 接口级去广。内置精简规则，不订阅外部列表。
 // @author       me
 // @match        *://*/*
 // @run-at       document-start
 // @grant        none
-// @updateURL    https://orange123eee.github.io/xb-plugins/adblock.user.js
-// @downloadURL  https://orange123eee.github.io/xb-plugins/adblock.user.js
+// @updateURL    https://orange123eee.github.io/xb-video-kit/adblock.user.js
+// @downloadURL  https://orange123eee.github.io/xb-video-kit/adblock.user.js
 // ==/UserScript==
 
 // 思路与规则来源（只借鉴方法，不打包它们的完整列表）：
@@ -20,7 +20,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '2.0.1';
+  var VERSION = '2.2.1';
   var HOST = location.hostname.toLowerCase();
 
   if (window.__xbAdblock) return;
@@ -69,6 +69,13 @@
     // 真实站点里见到的
     'snaptrckr.fun', 'rallytrck.website', 'mayzaent.com', 'mavrtracktor.com',
     'myavlive.com', 'mycomic.com', 'jerkdolls.com', 'theporndude.com',
+    // v2.1.0：广告联盟新马甲 / 轮换域名（hilltopads 主域、propeller 新品牌 monetag、聚合与弹窗网）
+    'hilltopads.com', 'monetag.com', 'adspyglass.com', 'clickaine.com',
+    'popmyads.com', 'bidgear.com', 'zeropark.com',
+    // v2.2.1：epo18.com 诊断实录（nannvshuo.com 是正文图片/AI 域，勿拦）
+    'histats.com', 'dtscout.com', 'mrktmtrcs.net',
+    'sp0.baidu.com', 'zz.bdstatic.com',
+    'ozovokyytivwif.com', 'qlplayerr.cyou',
     // 统计 / 追踪
     'google-analytics.com', 'analytics.google.com',
     'scorecardresearch.com', 'quantserve.com', 'hotjar.com', 'mouseflow.com',
@@ -230,16 +237,24 @@
   var urlCache = Object.create(null);
   var urlCacheN = 0;
 
+  // 同站（第一方）也要拦的"硬广告"命名：只收弹窗系命名和 /ads.js|/pop.js 这种
+  // 不可能正常命名的文件（允许 .min/.pack 等压缩后缀），站内自己的 /ad/、/banner/ 路径仍然不动
+  var HARD_PATH_RE = /(^|\/)(popunder|popads|smartpop|clickunder)([\/._-]|$)|\/(ads?|pop|popup|popunder|video-ads?)([-.](min|pack|prod))*\.js(\?|#|$)/i;
+
   function classify(url, type) {
     if (!url) return '';
     try {
       var u = new URL(url, location.href);
       if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
       var h = u.hostname.toLowerCase();
-      if (!h || h === HOST) return '';
-      if (hostAllowed(h)) return '';
-      if (inSuffixMap(HOST_MAP, h)) return 'host';
-      if (type !== 'stylesheet' && type !== 'font' && thirdParty(h) && pathBlocked(u.pathname)) return 'path';
+      if (!h) return '';
+      if (h !== HOST && hostAllowed(h)) return '';
+      if (h !== HOST && inSuffixMap(HOST_MAP, h)) return 'host';
+      if (!thirdParty(h)) {
+        // 第一方/同 base 域（含子域）：只拦"硬广告"命名，其余全放行
+        return HARD_PATH_RE.test(u.pathname) ? 'path1p' : '';
+      }
+      if (type !== 'stylesheet' && type !== 'font' && pathBlocked(u.pathname)) return 'path';
     } catch (e) {}
     return '';
   }
@@ -259,7 +274,7 @@
    *  统计 / 调试
    * ------------------------------------------------------------------ */
 
-  var stat = { req: 0, el: 0, pop: 0, yt: 0, ytapi: 0 };
+  var stat = { req: 0, el: 0, pop: 0, yt: 0, ytapi: 0, skip: 0 };
   window.__ab = {
     version: VERSION,
     stats: stat,
@@ -272,7 +287,7 @@
   };
 
   function totalBlocked() {
-    return stat.req + stat.el + stat.pop + stat.yt + stat.ytapi;
+    return stat.req + stat.el + stat.pop + stat.yt + stat.ytapi + stat.skip;
   }
   function bump(kind, url) {
     stat[kind]++;
@@ -399,6 +414,62 @@
       return _sb(url, data);
     };
   }
+
+  /* ------------------------------------------------------------------ *
+   *  广告库"假加载"空壳（反反拦截）
+   *  很多站点检测到广告脚本没加载就拒绝服务（黑屏 / 不给播）。
+   *  广告脚本被我们拦掉后，这里补一个"看起来加载成功"的空壳：
+   *  任何方法都能调、关键属性都是真值；站点自己后来赋真值会自然覆盖。
+   * ------------------------------------------------------------------ */
+
+  function noopChain() {
+    var cmdObj = {
+      push: function (f) { try { if (typeof f === 'function') f(); } catch (e) {} return 1; }
+    };
+    var p;
+    try {
+      var target = function () {};
+      p = new Proxy(target, {
+        get: function (t, k) {
+          if (k === 'apiReady' || k === 'pubadsReady' || k === 'loaded') return true;
+          if (k === 'cmd' || k === 'que') return cmdObj;
+          if (k === 'targetingKeys' || k === 'getSlots') return function () { return []; };
+          if (k === 'fetchBids') return function (o, cb) { try { if (cb) cb([]); } catch (e) {} };
+          var own = Reflect.get(t, k);
+          if (own !== undefined) return own;
+          return function () { return p; };
+        },
+        apply: function () { return p; }
+      });
+      return p;
+    } catch (e) {
+      // 老内核没有 Proxy：固定方法名简版
+      var o = {};
+      ['pubads', 'defineSlot', 'defineOutOfPageSlot', 'enableServices', 'enableSingleRequest',
+        'setTargeting', 'addService', 'collapseEmptyDivs', 'disableInitialLoad', 'refresh',
+        'addEventListener', 'setCentering', 'defineSizeMapping', 'addSize', 'build',
+        'clear', 'destroySlots', 'setDisplayBids', 'init'
+      ].forEach(function (m) { o[m] = function () { return o; }; });
+      o.apiReady = true;
+      o.pubadsReady = true;
+      o.loaded = true;
+      o.getSlots = o.targetingKeys = function () { return []; };
+      o.fetchBids = function (opt, cb) { try { if (cb) cb([]); } catch (e2) {} };
+      o.cmd = cmdObj;
+      o.que = cmdObj;
+      return o;
+    }
+  }
+
+  // googletag（GPT）必须兜：站点把它当基础设施用，脚本被拦又没壳的话，
+  // 站内代码第一行 googletag.cmd.push 就抛异常，连正文都跟着挂
+  try {
+    if (!window.googletag) window.googletag = noopChain();
+    else if (!window.googletag.cmd) window.googletag.cmd = noopChain().cmd;
+  } catch (e) {}
+  try { if (!window.adsbygoogle) window.adsbygoogle = noopChain(); } catch (e) {}
+  try { if (!window.apstag) window.apstag = noopChain(); } catch (e) {}
+  try { if (!window.pbjs) window.pbjs = noopChain(); } catch (e) {}   // prebid：que.push 模式
 
   // setAttribute('src'/'href'/'data'/'poster'/'srcset')
   var ATTRS = { src: 1, href: 1, data: 1, poster: 1, srcset: 1 };
@@ -954,6 +1025,53 @@
   }
 
   /* ------------------------------------------------------------------ *
+   *  4.5 通用播放器"跳过广告"自动点（不限站点）
+   *  明确文案（跳过广告 / 关闭广告 / Skip this ad）直接点；
+   *  裸"跳过 / Skip"要求离 video 足够近才点，防止误点站内其他跳转
+   * ------------------------------------------------------------------ */
+
+  var SKIP_EXACT = /^(跳过广告|跳过此广告|关闭广告|跳过 ?ads?|skip ?ads?|skip this ad|关闭 ?ads?|免广告继续|continue to video)$/i;
+  var SKIP_HAS = /跳过广告|跳过此广告|关闭广告|skip this ad|skip ad/i;
+  var SKIP_BARE = /^(跳过|skip|close ad)$/i;
+
+  function nearVideo(el) {
+    var n = el;
+    for (var i = 0; i < 6 && n && n !== document.body; i++) {
+      n = n.parentElement;
+      if (n && n.querySelector && n.querySelector('video')) return true;
+    }
+    return false;
+  }
+
+  function skipTick() {
+    if (!document.querySelector || !document.querySelector('video')) return;
+    var btns;
+    try {
+      btns = document.querySelectorAll('button,a,[role=button],div[class*="skip" i],span[class*="skip" i]');
+    } catch (e) {
+      try { btns = document.querySelectorAll('button,a,[role=button]'); } catch (e2) { return; }
+    }
+    var now2 = Date.now();
+    for (var i = 0; i < btns.length; i++) {
+      var b = btns[i];
+      if (b.__xbSkipAt && now2 - b.__xbSkipAt < 2500) continue;
+      var txt = '';
+      try { txt = (b.textContent || '').trim().replace(/\s+/g, ' '); } catch (e) {}
+      if (!txt || txt.length > 18) continue;
+      var hit = SKIP_EXACT.test(txt) || SKIP_HAS.test(txt);
+      if (!hit && SKIP_BARE.test(txt)) hit = nearVideo(b);
+      if (!hit) continue;
+      if (!(b.offsetWidth > 0 && b.offsetHeight > 0)) continue;   // 还没显示（倒计时中）不点
+      b.__xbSkipAt = now2;
+      try {
+        b.click();
+        stat.skip++;
+        maybeShowBadge();
+      } catch (e) {}
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
    *  5. 徽标 / 面板
    * ------------------------------------------------------------------ */
 
@@ -1064,7 +1182,7 @@
     var list = collectHosts();
     var lines = ['# 广告拦截诊断 v' + VERSION, '页面: ' + location.href,
       '拦截: 请求 ' + stat.req + ' · 元素 ' + stat.el + ' · 弹窗 ' + stat.pop +
-      ' · 视频 ' + stat.yt + ' · YouTube接口 ' + stat.ytapi, '', '外部域名:'];
+      ' · 视频 ' + stat.yt + ' · 跳过 ' + stat.skip + ' · YouTube接口 ' + stat.ytapi, '', '外部域名:'];
     for (var i = 0; i < list.length; i++) {
       var cls = classify('https://' + list[i][0] + '/', 'other');
       lines.push((cls ? '[已拦:' + cls + '] ' : '[未拦] ') + list[i][0] + ' x' + list[i][1]);
@@ -1094,6 +1212,7 @@
       '<span style="color:#5f6a7a">（请求 ' + stat.req + ' · 元素 ' + stat.el +
       (stat.pop ? ' · 弹窗 ' + stat.pop : '') +
       (stat.yt ? ' · 视频 ' + stat.yt : '') +
+      (stat.skip ? ' · 跳过 ' + stat.skip : '') +
       (stat.ytapi ? ' · YT接口 ' + stat.ytapi : '') + '）</span></div>';
 
     var hosts = collectHosts().slice(0, 10);
@@ -1208,6 +1327,8 @@
     cleanDead();
     sweep(document);
     ensureAllCss();
+    setInterval(skipTick, 700);   // 通用"跳过广告"自动点
+    skipTick();
     if (isYT) {
       setInterval(ytTick, 600);
       ytTick();

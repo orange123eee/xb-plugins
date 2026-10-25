@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频提取器 · 万能播放/下载
 // @namespace    local.xbrowser.videokit
-// @version      3.1.1
+// @version      3.2.0
 // @description  自动嗅探网页视频（直链 / m3u8 / MSE 流），自带播放器（倍速、清晰度切换、全片拖动）与站内下载管理（不跳系统下载器，可打开/分享/导出），多线程下载并合并为 mp4。
 // @author       me
 // @match        *://*/*
@@ -22,7 +22,7 @@
   try { IS_TOP = (window.top === window.self); } catch (e) { IS_TOP = false; }
 
   var MAX_ITEMS = 40;
-  var VERSION = '3.1.1';
+  var VERSION = '3.2.0';
 
   var CFG_KEY = 'xbvk.cfg';
   var cfg = {
@@ -1177,6 +1177,7 @@
   function syncProgress() {
     if (!playerOpen || !playerEl || !videoEl) return;
     if (seekBusy()) return;      // 手指按在进度条上时，播放事件不许改滑块
+    checkPState();
 
     var dur = playerDur();
     if (dur > 0) seekUI.lastDur = dur;
@@ -2830,18 +2831,26 @@
   }
 
   var embedTarget = null;
+  var embedSyncPend = false;
   function syncEmbed() {
     if (!playerOpen || !embedTarget || !embedTarget.getBoundingClientRect) return;
+    if (embedSyncPend) return;              // 滚动事件高频，样式更新合并到下一帧
+    embedSyncPend = true;
     try {
-      var r = embedTarget.getBoundingClientRect();
-      if (r.width < 40 || r.height < 30) return;
-      var er = embedRect(r);
-      playerEl.classList.toggle('mini', er.width < 340 || er.height < 200);
-      playerEl.style.left = er.left + 'px';
-      playerEl.style.top = er.top + 'px';
-      playerEl.style.width = er.width + 'px';
-      playerEl.style.height = er.height + 'px';
-    } catch (e) {}
+      requestAnimationFrame(function () {
+        embedSyncPend = false;
+        try {
+          var r = embedTarget.getBoundingClientRect();
+          if (r.width < 40 || r.height < 30) return;
+          var er = embedRect(r);
+          playerEl.classList.toggle('mini', er.width < 340 || er.height < 200);
+          playerEl.style.left = er.left + 'px';
+          playerEl.style.top = er.top + 'px';
+          playerEl.style.width = er.width + 'px';
+          playerEl.style.height = er.height + 'px';
+        } catch (e) {}
+      });
+    } catch (e) { embedSyncPend = false; }
   }
 
   function closePlayer() {
@@ -3035,6 +3044,13 @@
         }
       }, function (err) {
         stat.textContent = '';
+        try {
+          window.__xbvkErr = err && err.stack ? String(err.stack)
+            : err && err.type ? ('事件 ' + err.type + ' @ ' + (err.target && err.target.nodeName))
+            : String(err);
+          window.__xbvkErrMime = inst.mime || '';
+          window.__xbvkErrSegs = inst.segs ? inst.segs.length : -1;
+        } catch (e) {}
         try { inst.destroy(); } catch (e) {}
         if (hls === inst) hls = null;
         try { videoEl.removeAttribute('src'); videoEl.load(); } catch (e) {}
@@ -3348,6 +3364,28 @@
     return null;
   }
 
+  // 从 fMP4 init 段的 avcC box 里读出真实编码（profile/compat/level）。
+  // 主清单没写 CODECS 或写错时，靠猜的默认值会和实际码流不符，SourceBuffer 直接拒收——
+  // 这是"明明是 H264 却放不了"的一类根因
+  function mimeFromInit(buf, fallback) {
+    try {
+      var b = new Uint8Array(buf);
+      var avc = -1, hasAudio = false;
+      for (var i = 0; i < b.length - 8; i++) {
+        if (b[i] === 0x61 && b[i + 1] === 0x76 && b[i + 2] === 0x63 && b[i + 3] === 0x43) { avc = i; break; }   // 'avcC'
+        if (b[i] === 0x68 && b[i + 1] === 0x76 && b[i + 2] === 0x63 && b[i + 3] === 0x43) return null;          // 'hvcC' HEVC：保持原判（通常不支持）
+      }
+      if (avc < 0) return null;
+      var h = function (x) { var s = x.toString(16).toUpperCase(); return s.length < 2 ? '0' + s : s; };
+      var codec = 'avc1.' + h(b[avc + 5]) + h(b[avc + 6]) + h(b[avc + 7]);
+      for (var j = 0; j < b.length - 4; j++) {
+        if (b[j] === 0x6d && b[j + 1] === 0x70 && b[j + 2] === 0x34 && b[j + 3] === 0x61) { hasAudio = true; break; }  // 'mp4a'
+      }
+      var m = 'video/mp4; codecs="' + codec + (hasAudio ? ',mp4a.40.2' : '') + '"';
+      return MediaSource.isTypeSupported(m) ? m : null;
+    } catch (e) { return null; }
+  }
+
   var keyBytesCache = new Map();
   var cryptoKeyCache = new Map();
 
@@ -3486,6 +3524,7 @@
     this.hardRetried = false;
     this.finished = false;    // 点播分片已经全部处理完
     this.startedAt = 0;       // 实际起播位置（续播/跳片头生效时 > 0）
+    this.loadCount = 0;       // MSE 构建次数（诊断/测试：续播应只构建一次）
   }
 
   HlsPlayer.prototype.start = function (at, skip) {
@@ -3702,6 +3741,7 @@
   HlsPlayer.prototype.load = function (index, seekTime) {
     var self = this;
     var gen = ++this.gen;
+    this.loadCount++;
 
     var wasPlaying = false;
     try { wasPlaying = !this.video.paused; } catch (e) {}
@@ -3743,37 +3783,51 @@
       ms.addEventListener('sourceopen', function () { clearTimeout(timer); res(); }, { once: true });
     }).then(function () {
       if (gen !== self.gen) return;
-      var sb;
-      try { sb = ms.addSourceBuffer(self.mime); } catch (e) { throw new Error('addSourceBuffer 失败'); }
-      self.sb = sb;
-      try { sb.mode = 'segments'; } catch (e) {}
 
-      var initP = mapP ? mapP.then(function (b) {
+      // init 段先拿到、解密、嗅探真实编码，再建 SourceBuffer——
+      // 编码字符串猜错的话 SourceBuffer 会在追加时直接报错（"明明 H264 却放不了"的根因之一）
+      var initReadyP = mapP ? mapP.then(function (b) {
         if (self.map && self.map.key && self.map.key.method === 'AES-128') {
-          return decryptAes(b, self.map.key, self.mediaSeq).then(function (d) { return appendTo(sb, d); });
+          return decryptAes(b, self.map.key, self.mediaSeq);
         }
-        return appendTo(sb, b);
-      }) : Promise.resolve();
+        return b;
+      }).then(function (b) {
+        if (!self.transmux) {
+          var m2 = mimeFromInit(b, self.mime);
+          if (m2 && m2 !== self.mime) self.mime = m2;
+        }
+        return b;
+      }) : Promise.resolve(null);
 
-      var prep = muxP ? muxP.then(function (muxjs) {
+      return initReadyP.then(function (initBuf) {
         if (gen !== self.gen) return;
-        self.txOut.length = 0;
-        self.txInit = null;
-        self.txmux = new muxjs.mp4.Transmuxer();
-        if (index > 0 && typeof self.txmux.setBaseMediaDecodeTime === 'function') {
-          try { self.txmux.setBaseMediaDecodeTime(Math.round(self.segs[index].start * 90000)); } catch (e) {}
-        }
-        self.txmux.on('data', function (seg) {
-          if (!self.txInit && seg.initSegment && seg.initSegment.byteLength) self.txInit = seg.initSegment;
-          if (seg.data && seg.data.byteLength) self.txOut.push(seg.data);
-        });
-      }) : Promise.resolve();
+        var sb;
+        try { sb = ms.addSourceBuffer(self.mime); } catch (e) { throw new Error('addSourceBuffer 失败'); }
+        self.sb = sb;
+        try { sb.mode = 'segments'; } catch (e) {}
 
-      return prep.then(function () {
-        return initP.then(function () {
+        var initP = initBuf ? appendTo(sb, initBuf) : Promise.resolve();
+
+        var prep = muxP ? muxP.then(function (muxjs) {
           if (gen !== self.gen) return;
-          self.restarting = false;
-          self.pump(index, gen, sb, firstP);
+          self.txOut.length = 0;
+          self.txInit = null;
+          self.txmux = new muxjs.mp4.Transmuxer();
+          if (index > 0 && typeof self.txmux.setBaseMediaDecodeTime === 'function') {
+            try { self.txmux.setBaseMediaDecodeTime(Math.round(self.segs[index].start * 90000)); } catch (e) {}
+          }
+          self.txmux.on('data', function (seg) {
+            if (!self.txInit && seg.initSegment && seg.initSegment.byteLength) self.txInit = seg.initSegment;
+            if (seg.data && seg.data.byteLength) self.txOut.push(seg.data);
+          });
+        }) : Promise.resolve();
+
+        return prep.then(function () {
+          return initP.then(function () {
+            if (gen !== self.gen) return;
+            self.restarting = false;
+            self.pump(index, gen, sb, firstP);
+          });
         });
       });
     }).catch(function (e) {
@@ -4271,10 +4325,10 @@
           });
         },
         fail: function () {
-          // 任务模式的半成品必须留着续传（received 只在写成功后推进，
-          // 多写的字节会被下次 seek(offset) 覆盖，数据始终自洽）
+          // 任务模式：取消=暂停，必须 close() 提交已写数据——abort() 会按规范丢弃全部写入，
+          // 而 received 计数还在，下次续传 seek(received) 就会留出零字节空洞（测试 T8 抓到过）
           var p = writer
-            ? writer.abort().catch(function () {}).then(function () {
+            ? writer.close().catch(function () { return writer.abort(); }).catch(function () {}).then(function () {
                 if (opt.taskId) return;
                 return dlDir.removeEntry(id + '.bin').catch(function () {});
               })
@@ -4990,6 +5044,70 @@
       if (IS_TOP) { scanDom(); scanPerf(); }
     });
   }
+
+  // ---- 播放器状态看门狗：隐式状态机（十几个 class）跑飞时的报警器 ----。
+  // mini 残留（全屏却隐藏控件）这类历史 bug 靠它第一时间暴露
+  function pStateWarn(msg) {
+    try {
+      if (!pStateWarn._at || Date.now() - pStateWarn._at > 3000) {
+        pStateWarn._at = Date.now();
+        if (window.console && console.warn) console.warn('[xbvk] 状态异常: ' + msg);
+        window.__xbvkWarnLog = (window.__xbvkWarnLog || []).concat([msg]).slice(-20);
+      }
+    } catch (e) {}
+  }
+  function checkPState() {
+    if (!playerEl) return;
+    var c = playerEl.classList;
+    if (c.contains('mini') && !c.contains('embed')) pStateWarn('mini 未伴随 embed');
+    if (c.contains('open') !== !!playerOpen) pStateWarn('open class 与 playerOpen 不同步');
+    if (c.contains('loading') && c.contains('ended')) pStateWarn('loading 与 ended 并存');
+  }
+
+  // ---- 只读诊断/测试钩子：黑盒断言与远程诊断用，无任何可写入口 ----
+  try {
+    window.__xbvk = {
+      version: VERSION,
+      get playerOpen() { return !!playerOpen; },
+      get dlActive() { return dlActive; },
+      get cfg() { try { return JSON.parse(JSON.stringify(cfg)); } catch (e) { return null; } },
+      get warnings() { return (window.__xbvkWarnLog || []).slice(); },
+      items: function () {
+        return sortedItems().map(function (it) {
+          return { id: it.id, kind: it.kind, url: it.url, title: it.title, score: it.score };
+        });
+      },
+      downloads: function () {
+        return dlMan.files.map(function (f) { return { id: f.id, name: f.name, size: f.size }; });
+      },
+      pausedTasks: function () {
+        return dlTasks.map(function (t) {
+          return { id: t.id, kind: t.kind, name: t.name, received: t.received || 0 };
+        });
+      },
+      playerClass: function () { return playerEl ? playerEl.className : ''; },
+      currentTime: function () { return videoEl ? videoEl.currentTime : -1; },
+      duration: function () { return playerDur(); },
+      videoPaused: function () { return !!(videoEl && videoEl.paused); },
+      hls: function () {
+        return hls ? {
+          gen: hls.gen, loadCount: hls.loadCount, segs: hls.segs.length,
+          transmux: hls.transmux, ptsOffset: hls.ptsOffset,
+          total: hls.total, startedAt: hls.startedAt
+        } : null;
+      },
+      // 读下载文件片段（测试校验字节用）
+      dlBytes: function (idx, off, len) {
+        var f = dlMan.files[idx];
+        if (!f) return Promise.resolve(null);
+        return dlGetBlob(f).then(function (b) {
+          return b.slice(off, off + len).arrayBuffer().then(function (ab) {
+            return Array.prototype.slice.call(new Uint8Array(ab));
+          });
+        });
+      }
+    };
+  } catch (e) {}
 
   boot();
 })();

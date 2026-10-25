@@ -1,0 +1,4995 @@
+// ==UserScript==
+// @name         视频提取器 · 万能播放/下载
+// @namespace    local.xbrowser.videokit
+// @version      3.1.1
+// @description  自动嗅探网页视频（直链 / m3u8 / MSE 流），自带播放器（倍速、清晰度切换、全片拖动）与站内下载管理（不跳系统下载器，可打开/分享/导出），多线程下载并合并为 mp4。
+// @author       me
+// @match        *://*/*
+// @match        file:///*
+// @run-at       document-start
+// @grant        none
+// @updateURL    https://orange123eee.github.io/xb-plugins/video-extractor.user.js
+// @downloadURL  https://orange123eee.github.io/xb-plugins/video-extractor.user.js
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  if (window.__XB_VIDEO_KIT__) return;
+  window.__XB_VIDEO_KIT__ = true;
+
+  var IS_TOP = true;
+  try { IS_TOP = (window.top === window.self); } catch (e) { IS_TOP = false; }
+
+  var MAX_ITEMS = 40;
+  var VERSION = '3.1.1';
+
+  var CFG_KEY = 'xbvk.cfg';
+  var cfg = {
+    autoTakeover: true,   // 网页播放器自动接管
+    resume: true,         // 记忆播放进度
+    gestures: true,       // 画面手势（拖动/双击/长按/音量亮度）
+    skipIntro: 0,         // 跳过片头秒数
+    speed: 1,             // 默认倍速
+    segCache: true        // 边看边缓存（关掉就完全不占内存）
+  };
+  function loadCfg() {
+    try {
+      var o = JSON.parse(localStorage.getItem(CFG_KEY) || '{}');
+      for (var k in cfg) { if (o[k] !== undefined && o[k] !== null) cfg[k] = o[k]; }
+    } catch (e) {}
+  }
+  function saveCfg() {
+    try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (e) {}
+  }
+
+  var ICON = {
+    play: '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M8 5.2v13.6L19 12z"/></svg>',
+    pause: '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><rect x="7" y="5.4" width="3.4" height="13.2" rx="1.2"/><rect x="13.6" y="5.4" width="3.4" height="13.2" rx="1.2"/></svg>',
+    bigplay: '<svg viewBox="0 0 24 24" width="30" height="30" fill="currentColor"><path d="M8 5.2v13.6L19 12z"/></svg>',
+    vol: '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.4L12 5.6v12.8L7.4 14.5H4z"/><path d="M15.6 9.2a4 4 0 010 5.6"/></svg>',
+    mute: '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.4L12 5.6v12.8L7.4 14.5H4z"/><path d="M16 9.6l4.6 4.8M20.6 9.6L16 14.4"/></svg>',
+    full: '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4H4v5M15 4h5v5M15 20h5v-5M9 20H4v-5"/></svg>',
+    back: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 5.5L8 12l6.5 6.5"/></svg>',
+    replay: '<svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 10-2.4 5.7"/><path d="M20 4.8V11h-6.2"/></svg>',
+    dl: '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v9.6M8 10.2l4 4 4-4M5 19.4h14"/></svg>',
+    list: '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>',
+    pip: '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2.4"/><rect x="12" y="12" width="6.4" height="4.8" rx="1.2" fill="currentColor" stroke="none"/></svg>'
+  };
+
+  var rawFetch = (typeof window.fetch === 'function') ? window.fetch.bind(window) : null;
+
+  var selfReqs = new Set();
+  var variantSet = new Set();
+
+  function netFetch(url, init) {
+    if (!rawFetch) return Promise.reject(new Error('内核不支持 fetch'));
+    try {
+      selfReqs.add(String(url));
+      if (selfReqs.size > 500) selfReqs.delete(selfReqs.keys().next().value);   // 有界，别无限涨
+    } catch (e) {}
+    return rawFetch(url, init);
+  }
+
+  var NET_RE = /\.(mp4|m4v|webm|mkv|mov|flv|m3u8|mpd)(?:[?#]|$)/i;
+  var SRC_RE = /\.(mp4|m4v|webm|mkv|mov|flv|m3u8|mpd|ts|m4s|ogv)(?:[?#]|$)/i;
+  var MIME_RE = /^(video\/(mp4|webm|quicktime|x-matroska|x-flv)|application\/(vnd\.apple\.mpegurl|x-mpegurl|dash\+xml))/i;
+
+  var items = new Map();   // url -> item
+  var blobs = new Map();   // blobUrl -> {kind:'mse'|'blob', blob, mime}
+  var seq = 0;
+  var hasMse = false;
+  var hasVideoEl = false;
+  var ui = null;
+  var fabEl = null;
+  var sheetEl = null;
+  var listEl = null;
+  var dlistEl = null;
+  var setEl = null;
+  var settingsOpen = false;
+  var playerEl = null;
+  var videoEl = null;
+  var toastEl = null;
+  var progressEl = null;
+  var tvEl = null;        // txt 查看器
+  var ivEl = null;        // 图片查看器
+  var menuOpen = false;
+  var hls = null;
+  var current = null;
+  var playerOpen = false;
+  var sheetOpen = false;
+  var userPaused = false;      // 用户主动暂停过：之后的重建/补数据不许自动续播
+  var forcedEnded = false;     // 片源最后没有完整帧、播放器停在终点前：按播完处理
+  var uiGuardUntil = 0;
+  var siteVideo = null;        // 被接管的网页播放器
+  var siteWasPlaying = false;  // 接管前它是不是在播，退出接管要还原
+  var takeoverTried = false;
+  var playerHiddenForSheet = false;   // 从播放器打开列表时先把播放器藏起来，收起列表要放回去
+  var deepScanTick = 0;
+  var speedIdx = 2;
+  var SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
+  var pos = loadPos();
+
+  var listDirty = false;       // 面板没开时只记脏，不重排 DOM
+  var fabState = '';           // 悬浮球上次的显示状态，避免每轮扫描都写 style
+  var hasShadow = false;       // 页面用过 attachShadow 才值得深扫
+  var buildingUI = false;      // 正在建我们自己的 shadow root
+  var perfIndex = 0;           // 资源时序只处理新增条目
+  var idleTicks = 0;           // 连续没发现视频的轮数，用于降频
+  var playCache = new Map();   // m3u8 -> Promise<{r, pl}>，点播放时省掉一次往返
+  var textCache = new Map();   // m3u8 原文，直接从页面的响应里截获，避免重复请求
+  var bufCache = new Map();    // url -> {buf, ts}，只放 init 段这类小文件
+  var segCache = new Map();
+  var segCacheBytes = 0;
+  var SEG_CACHE_MAX = 40 * 1024 * 1024;
+
+  function putSegCache(key, buf) {
+    if (!cfg.segCache) return;                          // 用户关掉了缓存
+    if (!buf || !buf.byteLength) return;
+    if (buf.byteLength > 8 * 1024 * 1024) return;      // 单片太大就不占内存了
+    if (segCache.has(key)) return;
+    segCache.set(key, { buf: buf, ts: Date.now() });
+    segCacheBytes += buf.byteLength;
+    while (segCacheBytes > SEG_CACHE_MAX && segCache.size > 1) {
+      var oldest = null, oldestTs = Infinity;
+      segCache.forEach(function (v, k) {
+        if (v && v.ts < oldestTs) { oldestTs = v.ts; oldest = k; }
+      });
+      if (oldest == null) break;
+      var v = segCache.get(oldest);
+      segCacheBytes -= (v && v.buf && v.buf.byteLength) || 0;
+      segCache.delete(oldest);
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  工具
+   * ------------------------------------------------------------------ */
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  function absolutize(u) {
+    try { return new URL(u, location.href).href; } catch (e) { return u; }
+  }
+
+  function fmtBytes(n) {
+    if (!n || n < 0) return '';
+    if (n < 1024) return n + 'B';
+    if (n < 1048576) return (n / 1024).toFixed(0) + 'KB';
+    if (n < 1073741824) return (n / 1048576).toFixed(1) + 'MB';
+    return (n / 1073741824).toFixed(2) + 'GB';
+  }
+  function fmtRate(bps) {
+    if (!bps || bps < 1) return '';
+    if (bps < 1048576) return Math.round(bps / 1024) + 'KB/s';
+    return (bps / 1048576).toFixed(1) + 'MB/s';
+  }
+  function fmtEta(sec) {
+    if (!isFinite(sec) || sec < 0) return '';
+    if (sec < 60) return Math.ceil(sec) + ' 秒';
+    if (sec < 3600) return Math.round(sec / 60) + ' 分钟';
+    return (sec / 3600).toFixed(1) + ' 小时';
+  }
+  function rateTracker() {
+    var win = [];
+    return function (now, bytes) {
+      win.push([now, bytes]);
+      while (win.length > 1 && now - win[0][0] > 3000) win.shift();
+      var span = now - win[0][0];
+      return span > 500 ? (bytes - win[0][1]) * 1000 / span : 0;
+    };
+  }
+
+  function sanitize(s) {
+    return String(s || '').replace(/[\\/:*?"<>|\r\n\t]+/g, '_').replace(/\s+/g, ' ').trim().slice(0, 80) || 'video';
+  }
+
+  function hexToBytes(hex) {
+    hex = String(hex).replace(/[^0-9a-f]/gi, '');
+    if (hex.length % 2) hex = '0' + hex;
+    var out = new Uint8Array(hex.length / 2);
+    for (var i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return out;
+  }
+
+  function loadPos() {
+    try {
+      var p = JSON.parse(localStorage.getItem('xbvk.pos') || 'null');
+      if (p && typeof p.x === 'number' && typeof p.y === 'number') return p;
+    } catch (e) {}
+    return null;
+  }
+
+  function savePos(x, y) {
+    pos = { x: x, y: y };
+    try { localStorage.setItem('xbvk.pos', JSON.stringify(pos)); } catch (e) {}
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  嗅探：网络层
+   * ------------------------------------------------------------------ */
+  function hookXHR() {
+    var open = XMLHttpRequest.prototype.open;
+    var send = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function (method, url) {
+      try { this.__xbvk_url = url; } catch (e) {}
+      return open.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function () {
+      var xhr = this;
+      try {
+        xhr.addEventListener('load', function () {
+          try {
+            var u = xhr.responseURL || xhr.__xbvk_url;
+            if (!u) return;
+            var rawType = xhr.getResponseHeader('content-type') || '';
+            var type = rawType.split(';')[0].trim().toLowerCase();
+            var byUrl = NET_RE.test(u);
+            if (!byUrl && !MIME_RE.test(type)) return;
+            if (!allowByMime(type, byUrl)) return;
+
+            var size = parseInt(xhr.getResponseHeader('content-length') || '0', 10) || 0;
+            var kind = kindFromMime(type);
+            var abs = absolutize(u);
+            addItem(abs, kind, { from: 'net', size: size, mime: type, score: kind ? 55 : 50 });
+
+            if (kind === 'hls' || /\.m3u8(?:[?#]|$)/i.test(u)) {
+              try {
+                if (!xhr.responseType || xhr.responseType === 'text') seedText(abs, xhr.responseText);
+              } catch (e) {}
+            }
+          } catch (e) {}
+        });
+      } catch (e) {}
+      return send.apply(this, arguments);
+    };
+  }
+
+  function hookFetch() {
+    if (!window.fetch) return;
+    var orig = window.fetch;
+    window.fetch = function (input, init) {
+      var url = '';
+      try {
+        url = typeof input === 'string' ? input
+          : (window.URL && input instanceof URL) ? input.href
+          : (input && input.url) || '';
+      } catch (e) {}
+      var p = orig.apply(this, arguments);
+      try {
+        if (url) {
+          if (NET_RE.test(url)) addItem(absolutize(url), null, { from: 'net', score: 50 });
+
+          p.then(function (r) {
+            try {
+              var rawType = r.headers.get('content-type') || '';
+              var type = rawType.split(';')[0].trim().toLowerCase();
+              var byUrl = NET_RE.test(url);
+              if (!byUrl && !MIME_RE.test(type)) return;
+              if (!allowByMime(type, byUrl)) return;
+
+              var size = parseInt(r.headers.get('content-length') || '0', 10) || 0;
+              var kind = kindFromMime(type);
+              var abs = absolutize(url);
+              addItem(abs, kind, { from: 'net', size: size, mime: type, score: kind ? 55 : 50 });
+
+              if (kind === 'hls' || /\.m3u8(?:[?#]|$)/i.test(url)) {
+                r.clone().text().then(function (t) { seedText(abs, t); }, function () {});
+              }
+            } catch (e) {}
+          }, function () {});
+        }
+      } catch (e) {}
+      return p;
+    };
+  }
+
+  function kindFromMime(type) {
+    if (!type) return null;
+    if (/mpegurl/i.test(type)) return 'hls';
+    if (/dash\+xml/i.test(type)) return 'dash';
+    return null;
+  }
+
+  var ctItemCount = 0;
+  function allowByMime(type, byUrl) {
+    if (byUrl) return true;
+    if (/mpegurl|dash\+xml/i.test(type)) return true;
+    if (ctItemCount >= 10) return false;
+    ctItemCount++;
+    return true;
+  }
+
+  function scanPerf() {
+    try {
+      if (!performance || !performance.getEntriesByType) return;
+      var es = performance.getEntriesByType('resource');
+      if (es.length < perfIndex) perfIndex = 0;   // 缓冲区被清空过
+      for (var i = perfIndex; i < es.length; i++) {
+        var n = es[i].name;
+        if (n && NET_RE.test(n)) {
+          addItem(n, null, {
+            from: 'perf',
+            size: es[i].encodedBodySize || es[i].transferSize || 0,
+            score: 40
+          });
+        }
+      }
+      perfIndex = es.length;
+    } catch (e) {}
+  }
+
+  function watchPerf() {
+    try {
+      if (!window.PerformanceObserver) return;
+      var po = new PerformanceObserver(function (l) {
+        var es = l.getEntries();
+        for (var i = 0; i < es.length; i++) {
+          var n = es[i].name;
+          if (n && NET_RE.test(n)) {
+            addItem(n, null, { from: 'perf', size: es[i].encodedBodySize || 0, score: 40 });
+          }
+        }
+      });
+      po.observe({ type: 'resource' });   // 历史条目由 scanPerf 统一处理，避免重复
+    } catch (e) {}
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  嗅探：媒体元素
+   * ------------------------------------------------------------------ */
+  function onMediaUrl(el, value, from) {
+    if (!value) return;
+    var v = String(value);
+    if (v.indexOf('data:') === 0) return;
+
+    if (v.indexOf('blob:') === 0) {
+      var info = blobs.get(v);
+      if (info && info.kind === 'blob' && info.blob) {
+        addItem(v, 'blob', { from: from || 'dom', score: 70, blob: info.blob, mime: info.mime });
+      } else {
+        hasMse = true;
+        if (sheetOpen) scheduleRender();
+        ensureFab();
+      }
+      return;
+    }
+
+    if (!/^https?:/i.test(absolutize(v))) return;
+    if (!SRC_RE.test(v) && !/^https?:\/\/[^?#]+$/i.test(v)) return;
+
+    var kind = null;
+    if (/\.m3u8(?:[?#]|$)/i.test(v)) kind = 'hls';
+    else if (/\.mpd(?:[?#]|$)/i.test(v)) kind = 'dash';
+    else if (/\.flv(?:[?#]|$)/i.test(v)) kind = 'flv';
+    else if (/\.ts(?:[?#]|$)/i.test(v)) kind = 'ts';
+
+    addItem(absolutize(v), kind, { from: from || 'dom', score: 100 });
+  }
+
+  function hookSrcProp(proto) {
+    if (!proto) return;
+    var d = Object.getOwnPropertyDescriptor(proto, 'src');
+    if (!d || !d.set) return;
+    try {
+      Object.defineProperty(proto, 'src', {
+        configurable: true,
+        enumerable: d.enumerable,
+        get: d.get,
+        set: function (v) {
+          try { onMediaUrl(this, v, 'dom'); } catch (e) {}
+          return d.set.call(this, v);
+        }
+      });
+    } catch (e) {}
+  }
+
+  function hookMedia() {
+    hookSrcProp(window.HTMLMediaElement && HTMLMediaElement.prototype);
+    hookSrcProp(window.HTMLSourceElement && HTMLSourceElement.prototype);
+
+    var setAttr = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function (name, value) {
+      if (name === 'src' || (name.length === 3 && String(name).toLowerCase() === 'src')) {
+        try {
+          var tag = this.tagName;
+          if (tag === 'VIDEO' || tag === 'AUDIO' || tag === 'SOURCE') onMediaUrl(this, value, 'dom');
+        } catch (e) {}
+      }
+      return setAttr.apply(this, arguments);
+    };
+
+    try {
+      var attach = Element.prototype.attachShadow;
+      if (attach) {
+        Element.prototype.attachShadow = function () {
+          if (!buildingUI) hasShadow = true;   // 我们自己的 UI 不算
+          return attach.apply(this, arguments);
+        };
+      }
+    } catch (e) {}
+  }
+
+  function trimBlobs() {
+    while (blobs.size > 3) blobs.delete(blobs.keys().next().value);
+  }
+
+  function hookObjectUrl() {
+    if (!window.URL || !URL.createObjectURL) return;
+    var orig = URL.createObjectURL;
+    URL.createObjectURL = function (obj) {
+      var u = orig.apply(this, arguments);
+      try {
+        if (window.MediaSource && obj instanceof MediaSource) {
+          blobs.set(u, { kind: 'mse' });
+          trimBlobs();
+        } else if (window.Blob && obj instanceof Blob) {
+          var t = obj.type || '';
+          if ((t.indexOf('video/') === 0 || t.indexOf('audio/') === 0) && obj.size < 64 * 1024 * 1024) {
+            blobs.set(u, { kind: 'blob', blob: obj, mime: t });
+            trimBlobs();
+          }
+        }
+      } catch (e) {}
+      return u;
+    };
+  }
+
+  function collectVideos(root, out) {
+    out = out || [];
+    try {
+      var vs = root.querySelectorAll ? root.querySelectorAll('video') : [];
+      for (var i = 0; i < vs.length; i++) out.push(vs[i]);
+    } catch (e) {}
+    return out;
+  }
+
+  function scanDom() {
+    var vids = collectVideos(document);
+    if (vids.length) {
+      hasVideoEl = true;
+      if (IS_TOP) ensureFab();
+    }
+    if (!vids.length && hasShadow && (deepScanTick++ % 8 === 0)) {
+      try {
+        var all = document.querySelectorAll('*');
+        for (var i = 0; i < all.length && i < 3000; i++) {
+          if (all[i].shadowRoot) collectVideos(all[i].shadowRoot, vids);
+        }
+      } catch (e) {}
+    }
+    for (var k = 0; k < vids.length; k++) {
+      var v = vids[k];
+      try {
+        if (v.currentSrc) onMediaUrl(v, v.currentSrc, 'dom');
+        if (v.src) onMediaUrl(v, v.src, 'dom');
+        var ss = v.querySelectorAll('source');
+        for (var j = 0; j < ss.length; j++) {
+          if (ss[j].src) onMediaUrl(ss[j], ss[j].src, 'dom');
+        }
+      } catch (e) {}
+    }
+    if (vids.length && IS_TOP) scheduleAutoTakeover();
+
+    try {
+      var ifs = document.querySelectorAll('iframe');
+      for (var n = 0; n < ifs.length; n++) {
+        var doc = null;
+        try { doc = ifs[n].contentDocument; } catch (e) { doc = null; }
+        if (!doc) continue;
+        var iv = collectVideos(doc);
+        for (var m = 0; m < iv.length; m++) {
+          if (iv[m].currentSrc) onMediaUrl(iv[m], iv[m].currentSrc, 'dom');
+          if (iv[m].src) onMediaUrl(iv[m], iv[m].src, 'dom');
+        }
+      }
+    } catch (e) {}
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  数据源
+   * ------------------------------------------------------------------ */
+  function guessKind(url) {
+    if (/\.m3u8(?:[?#]|$)/i.test(url)) return 'hls';
+    if (/\.mpd(?:[?#]|$)/i.test(url)) return 'dash';
+    if (/\.flv(?:[?#]|$)/i.test(url)) return 'flv';
+    if (/\.ts(?:[?#]|$)/i.test(url)) return 'ts';
+    if (/\.webm(?:[?#]|$)/i.test(url)) return 'webm';
+    if (/^blob:/i.test(url)) return 'blob';
+    return 'mp4';
+  }
+
+  function guessTitle(it) {
+    var name = '';
+    if (/^blob:/i.test(it.url)) {
+      return sanitize(document.title || 'video');
+    }
+    try {
+      var u = new URL(it.url);
+      name = decodeURIComponent((u.pathname.split('/').pop() || ''));
+      name = name.replace(/\.(mp4|m4v|webm|mkv|mov|flv|m3u8|mpd|ts|m4s)$/i, '');
+      if (!name) name = u.hostname;
+    } catch (e) {}
+    var generic = /^(index|master|playlist|main|video|media|out|output|manifest|stream|hls|chunklist|prog_index|file|1|0)$/i;
+    if (!name || generic.test(name) || name.length < 3) {
+      var t = sanitize(document.title || '');
+      if (t) name = t + (name ? '_' + name : '');
+    }
+    return sanitize(name || 'video');
+  }
+
+  function addItem(url, kind, extra) {
+    if (!url) return null;
+    extra = extra || {};
+    var key = url;
+    var old = items.get(key);
+
+    if (old) {
+      var bumped = false;
+      if (extra.score && extra.score > old.score) { old.score = extra.score; bumped = true; }
+      if (extra.size && extra.size > old.size) { old.size = extra.size; bumped = true; }
+      if (extra.mime && !old.mime) { old.mime = extra.mime; bumped = true; }
+      if (bumped) {
+        listDirty = true;
+        if (sheetOpen) scheduleRender();
+      }
+      return old;
+    }
+
+    if ((selfReqs.has(key) || variantSet.has(key)) && extra.from !== 'dom' && extra.from !== 'frame') return null;
+
+    if (items.size >= MAX_ITEMS) {
+      var worstKey = null, worst = 1e9;
+      items.forEach(function (v, k) {
+        if (v.score < worst) { worst = v.score; worstKey = k; }
+      });
+      if (!worstKey) return null;
+      if (worst > (extra.score || 0)) return null;   // 新的还不如旧的，直接丢弃
+      items.delete(worstKey);
+    }
+
+    var it = {
+      id: ++seq,
+      url: key,
+      kind: kind || guessKind(key),
+      from: extra.from || 'net',
+      mime: extra.mime || '',
+      size: extra.size || 0,
+      blob: extra.blob || null,
+      score: extra.score || 30,
+      ts: Date.now()
+    };
+    it.title = guessTitle(it);
+    items.set(key, it);
+    listDirty = true;
+    if (!IS_TOP) postToParent(it);          // 子框架把地址抛给顶层
+    if (sheetOpen) scheduleRender();
+    ensureFab();
+
+    if (IS_TOP && it.kind === 'hls' && hlsPrefetchCount < 3) {
+      hlsPrefetchCount++;
+      setTimeout(function () { getPlaylist(it.url).catch(function () {}); }, 600);
+    }
+    if (IS_TOP) scheduleAutoTakeover();
+    return it;
+  }
+
+  function sortedItems() {
+    var arr = [];
+    items.forEach(function (v) { arr.push(v); });
+    arr.sort(function (a, b) {
+      if (b.score !== a.score) return b.score - a.score;
+      return a.ts - b.ts;
+    });
+    return arr;
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  UI
+   * ------------------------------------------------------------------ */
+  var CSS = [
+    ':host{all:initial}',
+    '*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}',
+    '.fab{position:fixed;height:42px;padding:0 13px 0 11px;border-radius:21px;display:flex;align-items:center;gap:5px;',
+    'background:linear-gradient(160deg,rgba(41,44,52,.97),rgba(20,22,27,.97));border:1px solid rgba(255,255,255,.14);',
+    'box-shadow:0 8px 26px rgba(0,0,0,.55),0 2px 8px rgba(0,0,0,.4);',
+    'pointer-events:auto;touch-action:none;z-index:9;transition:opacity .18s,transform .18s}',
+    '.fab .lb{font:600 12px/1 -apple-system,"PingFang SC","Noto Sans SC",sans-serif;color:#e9ebef;letter-spacing:.5px}',
+    '.fab:active{transform:scale(.94)}',
+    '.fab.press{transform:scale(.9);opacity:.85}',
+    '.fab .dot{position:absolute;top:3px;right:3px;min-width:16px;height:16px;padding:0 4px;border-radius:8px;',
+    'background:linear-gradient(135deg,#ff8cab,#fb7299);color:#fff;font:600 10px/16px -apple-system,sans-serif;',
+    'text-align:center;display:none;box-shadow:0 2px 8px rgba(251,114,153,.5)}',
+    '.fab.has .dot{display:block}',
+    '.fab .tip{position:absolute;left:50%;bottom:58px;transform:translateX(-50%);white-space:nowrap;',
+    'background:rgba(22,24,29,.96);color:#e9ebef;font:12px/1 -apple-system,sans-serif;padding:8px 10px;',
+    'border-radius:8px;border:1px solid rgba(255,255,255,.16);box-shadow:0 4px 14px rgba(0,0,0,.45);display:none}',
+    '.fab.tipon .tip{display:block}',
+    '.fab .tip.b{bottom:auto;top:58px}',
+    '.mask{position:fixed;inset:0;background:rgba(0,0,0,.45);opacity:0;pointer-events:none;transition:opacity .2s;z-index:1}',
+    '.mask.on{opacity:1;pointer-events:auto}',
+    '.sheet{position:fixed;left:0;right:0;bottom:0;background:#16181d;color:#e9ebef;border-radius:20px 20px 0 0;',
+    'box-shadow:0 -10px 40px rgba(0,0,0,.6);transform:translateY(105%);transition:transform .26s cubic-bezier(.2,.85,.25,1);',
+    'pointer-events:auto;z-index:2;max-height:74vh;display:flex;flex-direction:column;',
+    'font:14px/1.45 -apple-system,"PingFang SC","Noto Sans SC",sans-serif;padding-bottom:calc(8px + env(safe-area-inset-bottom))}',
+    '.sheet::before{content:"";position:absolute;top:7px;left:50%;transform:translateX(-50%);width:34px;height:4px;',
+    'border-radius:2px;background:rgba(255,255,255,.14)}',
+    '.sheet.open{transform:translateY(0)}',
+    '.hd{display:flex;align-items:center;gap:8px;padding:16px 16px 10px;border-bottom:1px solid rgba(255,255,255,.07)}',
+    '.hd h3{margin:0;font-size:15px;font-weight:650;flex:1;letter-spacing:.3px}',
+    '.hd .cnt{font-size:12px;color:#8b93a1}',
+    '.hd button{background:rgba(255,255,255,.07);border:0;color:#c4cbd6;border-radius:8px;padding:6px 10px;',
+    'font-size:12px;font-weight:500;transition:background .15s,transform .12s}',
+    '.hd button:active{background:rgba(255,255,255,.16);transform:scale(.95)}',
+    '.hint{padding:2px 18px 8px;font-size:11px;color:#6f7683}',
+    '.list{overflow-y:auto;-webkit-overflow-scrolling:touch;padding:4px 12px 10px}',
+    '.empty{padding:24px 20px;color:#8b93a1;font-size:13px;text-align:center;line-height:1.8}',
+    '.empty svg{display:block;margin:0 auto 10px;opacity:.85}',
+    '.empty b{color:#cfd5de;font-weight:600}',
+    '.empty .mini{margin-top:12px;height:34px;padding:0 18px;border-radius:9px;border:1px solid rgba(255,255,255,.14);',
+    'background:rgba(255,255,255,.07);color:#dde2ea;font-size:12.5px;transition:transform .12s,background .15s}',
+    '.empty .mini:active{transform:scale(.95);background:rgba(255,255,255,.13)}',
+    '.it{background:rgba(255,255,255,.045);border:0;border-radius:12px;margin-bottom:8px;padding:11px 12px;',
+    'transition:background .15s}',
+    '.it:active{background:rgba(255,255,255,.09)}',
+    '.tabs{display:flex;gap:6px;padding:10px 16px 0}',
+    '.tabs button{flex:1;height:34px;border-radius:9px;border:0;background:transparent;color:#8b93a1;',
+    'font-size:13px;font-weight:600;transition:background .15s,color .15s}',
+    '.tabs button.on{background:rgba(251,114,153,.14);color:#ff9dbb}',
+    '.tabs button .dnum{display:none;font:600 10px/1 -apple-system,sans-serif;background:linear-gradient(135deg,#ff8cab,#fb7299);',
+    'color:#fff;border-radius:8px;padding:2px 6px;margin-left:6px;vertical-align:1px}',
+    '.tabs button .dnum.on{display:inline-block}',
+    '.sheet.dltab .list,.sheet.dltab .hint{display:none}',
+    '.sheet:not(.dltab) .dlist{display:none}',
+    '.sheet.dltab .hd [data-a="rescan"]{display:none}',
+    '.dlist{overflow-y:auto;-webkit-overflow-scrolling:touch;padding:4px 12px 10px}',
+    '.dluse{display:flex;align-items:center;gap:8px;padding:2px 4px 10px;font-size:11px;color:#6f7683}',
+    '.dluse b{font-weight:500;color:#8b93a1}',
+    '.dluse .sp{flex:1}',
+    '.dluse button{background:rgba(255,255,255,.07);border:0;color:#c4cbd6;border-radius:7px;',
+    'padding:4px 10px;font-size:11px;transition:transform .12s,background .15s}',
+    '.dluse button:active{transform:scale(.95);background:rgba(255,255,255,.15)}',
+    '.dlrun{display:flex;align-items:center;gap:8px;margin-bottom:10px;padding:10px 12px;border-radius:12px;',
+    'background:rgba(251,114,153,.1);color:#ff9dbb;font-size:12px}',
+    '.dit{background:rgba(255,255,255,.045);border-radius:12px;margin-bottom:8px;padding:11px 12px;transition:background .15s}',
+    '.dit:active{background:rgba(255,255,255,.09)}',
+    '.dit .r1{display:flex;align-items:center;gap:10px}',
+    '.dit .ic{flex:none;width:36px;height:36px;border-radius:10px;background:rgba(79,140,255,.14);',
+    'display:flex;align-items:center;justify-content:center}',
+    '.dit .ic.txt{background:rgba(56,205,150,.14)}',
+    '.dit .ic.img{background:rgba(255,171,64,.16)}',
+    '.dit .nm{flex:1;min-width:0}',
+    '.dit .nm b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;',
+    'font-weight:500;color:#e9ebef}',
+    '.dit .nm i{font-style:normal;font-size:10.5px;color:#79808d;margin-top:2px;display:block}',
+    '.dit .acts{display:flex;gap:8px;margin-top:10px}',
+    '.dit .acts button{flex:1;height:32px;border-radius:8px;border:1px solid rgba(255,255,255,.1);',
+    'background:rgba(255,255,255,.06);color:#dde2ea;font-size:12px;font-weight:500;transition:transform .12s,background .15s}',
+    '.dit .acts button:active{transform:scale(.96);background:rgba(255,255,255,.14)}',
+    '.dit .acts button.pri{background:linear-gradient(135deg,#ff8cab,#fb7299);border:0;color:#fff}',
+    '.vw{position:fixed;inset:0;background:#101216;color:#e9ebef;z-index:6;display:none;flex-direction:column;pointer-events:auto}',
+    '.vw.open{display:flex;animation:xbplfade .18s ease-out}',
+    '.vw .vhd{display:flex;align-items:center;gap:10px;padding:calc(10px + env(safe-area-inset-top)) 12px 10px;',
+    'border-bottom:1px solid rgba(255,255,255,.07);flex:none}',
+    '.vw .vhd .vt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:500}',
+    '.vw .vhd button{height:32px;min-width:32px;padding:0 10px;border-radius:9px;border:0;',
+    'background:rgba(255,255,255,.08);color:#cfd5de;font-size:12.5px;display:flex;align-items:center;justify-content:center}',
+    '.vw .vhd button:active{background:rgba(255,255,255,.16)}',
+    '.vw pre.vbody{flex:1;overflow:auto;-webkit-overflow-scrolling:touch;margin:0;padding:14px 16px;',
+    'color:#d6dae2;font:13px/1.75 ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word}',
+    '.vw .vimgw{flex:1;overflow:auto;-webkit-overflow-scrolling:touch;display:flex;align-items:center;justify-content:center;padding:12px}',
+    '.vw .vimgw img{max-width:100%;max-height:100%;object-fit:contain;border-radius:8px}',
+    '.r1{display:flex;align-items:center;gap:7px;margin-bottom:3px}',
+    '.badge{font:600 10px/1 -apple-system,sans-serif;padding:4px 6px;border-radius:5px;background:rgba(79,140,255,.18);',
+    'color:#7fa9ff;letter-spacing:.3px;flex:none}',
+    '.badge.mse{background:rgba(255,171,64,.16);color:#ffb545}',
+    '.badge.hls{background:rgba(56,205,150,.16);color:#3ecd96}',
+    '.nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13.5px;color:#e9ebef}',
+    '.sz{font-size:11px;color:#79808d;flex:none}',
+    '.u{font-size:11px;color:#6d7480;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:8px;direction:rtl;text-align:left}',
+    '.acts{display:flex;gap:8px}',
+    '.acts button{flex:1;height:34px;border-radius:9px;border:1px solid rgba(255,255,255,.1);',
+    'background:rgba(255,255,255,.06);color:#dde2ea;font-size:12.5px;font-weight:500;',
+    'transition:background .15s,transform .12s}',
+    '.acts button:active{background:rgba(255,255,255,.14);transform:scale(.97)}',
+    '.acts button.pri{background:linear-gradient(135deg,#ff8cab,#fb7299);border:0;color:#fff;',
+    'box-shadow:0 3px 12px rgba(251,114,153,.32)}',
+    '.acts button.pri:active{filter:brightness(1.12);transform:scale(.97)}',
+    '.ft{padding:10px 16px 4px;display:flex;gap:8px;align-items:center}',
+    '.ft .ver{font-style:normal;font-size:10px;color:#5d6470;flex:none}',
+    '.ft button{flex:1;height:38px;border-radius:10px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.05);',
+    'color:#cfd5de;font-size:13px;transition:background .15s,transform .12s}',
+    '.ft button:active{background:rgba(255,255,255,.12);transform:scale(.98)}',
+    '.pl{position:fixed;inset:0;background:#000;display:none;flex-direction:column;pointer-events:auto;z-index:3;overscroll-behavior:contain}',
+    '.pl.open{display:flex}',
+    '.pl.embed{border-radius:10px;overflow:hidden;box-shadow:0 10px 34px rgba(0,0,0,.55)}',
+    '.pl .top{display:flex;align-items:center;gap:10px;padding:calc(8px + env(safe-area-inset-top)) 12px 10px;',
+    'background:linear-gradient(rgba(0,0,0,.74),rgba(0,0,0,0));position:absolute;left:0;right:0;top:0;z-index:4;transition:opacity .25s}',
+    '.pl .top button{height:34px;min-width:34px;width:34px;padding:0;border-radius:50%;border:0;background:rgba(0,0,0,.3);',
+    'color:#fff;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px);',
+    'box-shadow:0 1px 6px rgba(0,0,0,.35)}',
+    '.pl .top button:active{background:rgba(255,255,255,.2)}',
+    '.pl .t{flex:1;color:#fff;font-size:13.5px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;',
+    'opacity:.95;letter-spacing:.1px;text-shadow:0 1px 6px rgba(0,0,0,.65)}',
+    '.pl .stage{position:absolute;inset:0;display:flex;background:#000}',
+    '.pl .dim{position:absolute;inset:0;background:#000;opacity:0;pointer-events:none;z-index:2}',
+    '.pl.embed.loading{background:transparent}',
+    '.pl.embed.loading video{background:transparent}',
+    '.pl.loading .bigplay,.pl.loading .ctl,.pl.loading .top,.pl.loading .side{opacity:0;pointer-events:none}',
+    '.pl .spin{position:absolute;left:50%;top:50%;width:34px;height:34px;margin:-17px 0 0 -17px;border-radius:50%;',
+    'border:3px solid rgba(255,255,255,.25);border-top-color:#fff;background:rgba(0,0,0,.38);',
+    'box-shadow:0 2px 14px rgba(0,0,0,.55);animation:xbspin .8s linear infinite;',
+    'display:none;z-index:6}',
+    '.pl.loading .spin{display:block}',
+    '@keyframes xbspin{to{transform:rotate(360deg)}}',
+    '.pl video{flex:1;width:100%;height:100%;object-fit:contain;background:#000;display:block}',
+    '.pl .bigplay{position:absolute;left:50%;top:50%;width:72px;height:72px;margin:-36px 0 0 -36px;border-radius:50%;',
+    'background:rgba(251,114,153,.94);border:0;color:#fff;display:none;align-items:center;',
+    'justify-content:center;z-index:3;box-shadow:0 8px 30px rgba(251,114,153,.34),0 4px 16px rgba(0,0,0,.42);',
+    'transition:transform .16s,background .16s}',
+    '.pl .bigplay svg{width:34px;height:34px;margin-left:3px}',
+    '.pl .bigplay .bp-play,.pl .bigplay .bp-replay{display:flex;align-items:center;justify-content:center}',
+    '.pl .bigplay .bp-replay{display:none}',
+    '.pl.ended .bigplay .bp-play{display:none}',
+    '.pl.ended .bigplay .bp-replay{display:flex}',
+    '.pl.paused .bigplay{display:flex;animation:xbpop .18s ease-out}',
+    '.pl.paused .bigplay:active{transform:scale(.92);background:rgba(251,114,153,1)}',
+    '@keyframes xbpop{from{transform:scale(.82);opacity:.5}to{transform:scale(1);opacity:1}}',
+    '.pl.loading .bigplay{display:none}',
+    '.pl.seeking .bigplay{display:none!important}',
+    '.pl.seeking .spin{display:block}',
+    '.pl.buffering .bigplay{display:none!important}',
+    '.pl.buffering .spin{display:block}',
+    '.pl .freeze{position:absolute;left:0;top:0;width:100%;height:100%;object-fit:contain;display:none;z-index:1;pointer-events:none}',
+    '.pl .seekpreview{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:none;align-items:center;',
+    'gap:10px;background:rgba(18,19,23,.84);color:#fff;padding:10px 15px;border-radius:12px;z-index:5;pointer-events:none;',
+    'border:1px solid rgba(255,255,255,.1);box-shadow:0 6px 22px rgba(0,0,0,.42);backdrop-filter:blur(10px)}',
+    '.pl .seekpreview b{font-size:18px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.1}',
+    '.pl .seekpreview i{font-style:normal;font-size:12px;opacity:.9;color:#ff9dbb;font-variant-numeric:tabular-nums}',
+    '.pl .seekpreview.hud{flex-direction:column;align-items:flex-start;gap:7px;min-width:94px;padding:10px 12px}',
+    '.pl .seekpreview.hud b{font-size:17px}',
+    '.pl .seekpreview.hud i{font-size:10.5px;color:rgba(255,255,255,.7);order:-1;letter-spacing:.5px}',
+    '.pl .seekpreview .bar{display:none;width:74px;height:3px;border-radius:2px;background:rgba(255,255,255,.22);overflow:hidden}',
+    '.pl .seekpreview .bar em{display:block;width:0;height:100%;border-radius:2px;background:#fb7299}',
+    '.pl .seekpreview.hud .bar{display:block}',
+    '.pl .seekpreview.left{left:17%}',
+    '.pl .seekpreview.right{left:83%}',
+    '.pl .ctl{position:absolute;left:0;right:0;bottom:0;z-index:4;padding:32px 14px calc(10px + env(safe-area-inset-bottom));',
+    'background:linear-gradient(transparent,rgba(0,0,0,.78) 40%,rgba(0,0,0,.94));transition:opacity .25s}',
+    '.pl.hideui .top,.pl.hideui .ctl{opacity:0;pointer-events:none}',
+    '.pl .seek{position:relative;height:34px;display:flex;align-items:center;touch-action:none;cursor:pointer;margin-bottom:0}',
+    '.pl .seek .track{position:absolute;left:0;right:0;height:3px;border-radius:2px;background:rgba(255,255,255,.18)}',
+    '.pl .seek .buf{position:absolute;left:0;width:0;height:3px;border-radius:2px;background:rgba(255,255,255,.3)}',
+    '.pl .seek .bar{position:absolute;left:0;width:0;height:3px;border-radius:2px;background:#fb7299;box-shadow:0 0 7px rgba(251,114,153,.42)}',
+    '.pl .seek .knob{position:absolute;left:0;width:12px;height:12px;border-radius:50%;background:#fff;',
+    'margin-left:-6px;border:2px solid #fb7299;box-shadow:0 2px 8px rgba(0,0,0,.45);transition:transform .12s}',
+    '.pl .seek.on .knob{transform:scale(1.28)}',
+    '.pl .seek .track,.pl .seek .buf,.pl .seek .bar{transition:height .16s}',
+    '.pl .seek.on .track,.pl .seek.on .buf,.pl .seek.on .bar{height:5px}',
+    '.pl .seek .tip{position:absolute;bottom:30px;left:0;transform:translateX(-50%);background:rgba(20,21,25,.94);',
+    'color:#fff;font:600 11px/1 -apple-system,"PingFang SC",sans-serif;padding:6px 8px;border-radius:7px;',
+    'white-space:nowrap;opacity:0;pointer-events:none;transition:opacity .12s;z-index:5;font-variant-numeric:tabular-nums;',
+    'border:1px solid rgba(255,255,255,.1)}',
+    '.pl .seek.on .tip{opacity:1}',
+    '.pl .ctlrow{display:flex;align-items:center;gap:6px;height:38px}',
+    '.pl .ctlrow button{height:30px;padding:0 9px;border-radius:8px;border:0;background:rgba(255,255,255,.09);',
+    'color:#f1f3f6;font-size:12px;font-weight:500;flex:none;transition:background .15s,transform .12s}',
+    '.pl .ctlrow button:active{background:rgba(255,255,255,.2);transform:scale(.94)}',
+    '.pl .ctlrow button.ico{width:34px;padding:0;background:transparent;display:flex;align-items:center;justify-content:center}',
+    '.pl .ctlrow button.ico:active{background:rgba(255,255,255,.12)}',
+    '.pl .ctlrow button.on{background:rgba(251,114,153,.18);color:#ff9dbb}',
+    '.pl .ctlrow button[data-a="speed"]::after,.pl .ctlrow button[data-a="q"]::after{content:"";display:inline-block;',
+    'width:0;height:0;border-left:3px solid transparent;border-right:3px solid transparent;border-top:4px solid currentColor;',
+    'margin-left:5px;opacity:.65;vertical-align:middle}',
+    '.pl .side{position:absolute;right:10px;bottom:calc(100px + env(safe-area-inset-bottom));z-index:4;display:flex;',
+    'flex-direction:column;gap:10px;transition:opacity .25s}',
+    '.pl .side button{width:42px;height:42px;border-radius:50%;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.36);',
+    'color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;backdrop-filter:blur(6px)}',
+    '.pl .side button:active{transform:scale(.94);background:rgba(255,255,255,.18)}',
+    '.pl .side button i{font-style:normal;font-size:8.5px;color:rgba(255,255,255,.78);line-height:1}',
+    '.pl.embed .side{bottom:calc(92px + env(safe-area-inset-bottom));gap:8px}',
+    '.pl.embed .side button{width:36px;height:36px}',
+    '.pl.embed .side button i{font-size:8px}',
+    '.pl.embed .side [data-a="pip"]{display:none}',
+    '.pl.hideui .side{opacity:0;pointer-events:none}',
+    '.pl .top .mfull{display:none}',
+    '.pl.mini .t{display:none}',
+    '.pl.mini .top{background:none;justify-content:space-between;padding:5px 6px;gap:0}',
+    '.pl.mini .top button{width:28px;height:28px;min-width:28px;background:rgba(0,0,0,.42)}',
+    '.pl.mini .top .mfull{display:flex}',
+    '.pl.mini .side,.pl.mini .ctl{display:none}',
+    '.pl .mtrack{display:none;position:absolute;left:0;right:0;bottom:0;height:2.5px;background:rgba(255,255,255,.2);z-index:4}',
+    '.pl .mtrack b{display:block;height:100%;width:0;background:#fb7299;border-radius:0 2px 2px 0}',
+    '.pl.mini .mtrack{display:block}',
+    '.pl.mini .bigplay{width:44px;height:44px;margin:-22px 0 0 -22px}',
+    '.pl.mini .bigplay svg{width:21px;height:21px}',
+    '.pl.mini .spin{width:24px;height:24px;margin:-12px 0 0 -12px;border-width:2.5px}',
+    '.pl.mini .seekpreview{padding:7px 11px;gap:6px}',
+    '.pl.mini .seekpreview b{font-size:14px}',
+    '.pl .ctlrow .tm{font-size:11.5px;color:rgba(255,255,255,.78);font-variant-numeric:tabular-nums;flex:none;white-space:nowrap}',
+    '.pl .ctlrow .stat{font-size:10px;color:rgba(255,255,255,.42);flex:none;max-width:96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.pl.embed .ctlrow .stat{display:none}',
+    '.pl .ctlrow .sp{flex:1}',
+    '.pl .pmask{position:absolute;inset:0;z-index:7;display:none;background:rgba(0,0,0,.16)}',
+    '.pl .pmask.on{display:block}',
+    '.pl .pmenu{position:absolute;right:12px;bottom:calc(60px + env(safe-area-inset-bottom));z-index:8;display:none;',
+    'min-width:150px;max-width:calc(100% - 24px);max-height:52vh;overflow-y:auto;-webkit-overflow-scrolling:touch;',
+    'background:rgba(22,23,28,.97);border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:8px;',
+    'box-shadow:0 10px 30px rgba(0,0,0,.55);backdrop-filter:blur(14px);',
+    'font:12.5px/1.4 -apple-system,"PingFang SC","Noto Sans SC",sans-serif}',
+    '.pl .pmenu.on{display:block;animation:xbmenupop .16s ease-out}',
+    '@keyframes xbmenupop{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}',
+    '@keyframes xbit{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}',
+    '.pl.open{animation:xbplfade .2s ease-out}',
+    '@keyframes xbplfade{from{opacity:0}to{opacity:1}}',
+    '.pl .freeze{animation:xbfdin .16s ease-out}',
+    '@keyframes xbfdin{from{opacity:.35}to{opacity:1}}',
+    '.set.open .sbody>*{animation:xbit .2s ease-out backwards}',
+    '.set.open .sbody>*:nth-child(2){animation-delay:25ms}',
+    '.set.open .sbody>*:nth-child(3){animation-delay:50ms}',
+    '.set.open .sbody>*:nth-child(4){animation-delay:75ms}',
+    '.set.open .sbody>*:nth-child(5){animation-delay:100ms}',
+    '.set.open .sbody>*:nth-child(6){animation-delay:125ms}',
+    '.set.open .sbody>*:nth-child(7){animation-delay:150ms}',
+    '.set.open .sbody>*:nth-child(8){animation-delay:175ms}',
+    '.set.open .sbody>*:nth-child(9){animation-delay:200ms}',
+    '.sheet .list::-webkit-scrollbar,.set .sbody::-webkit-scrollbar,.pl .pmenu::-webkit-scrollbar{display:none}',
+    '.pl .pmenu .pmt{font-size:10.5px;color:#8b93a1;padding:2px 6px 7px;letter-spacing:.3px}',
+    '.pl .pmenu button{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;height:32px;',
+    'padding:0 9px;border:0;border-radius:7px;background:transparent;color:#e9ebef;font-size:12.5px;text-align:left}',
+    '.pl .pmenu button:active{background:rgba(255,255,255,.1)}',
+    '.pl .pmenu button.on{color:#ff9dbb;background:rgba(251,114,153,.14);font-weight:600}',
+    '.pl .pmenu button.on::after{content:"✓";font-size:11px;color:#fb7299}',
+    '.pl .pmenu.grid{width:232px}',
+    '.pl .pmenu.grid .pmbody{display:grid;grid-template-columns:repeat(4,minmax(48px,1fr));gap:4px}',
+    '.pl .pmenu.grid button{justify-content:center;height:30px;padding:0 4px;font-size:12px}',
+    '.pl .pmenu.grid button.on::after{content:""}',
+    '.toast{position:fixed;left:50%;bottom:130px;transform:translate(-50%,10px);background:rgba(17,19,23,.88);color:#e9ebef;',
+    'padding:10px 14px;border-radius:11px;font:13px/1.4 -apple-system,sans-serif;max-width:80vw;text-align:center;',
+    'border:1px solid rgba(255,255,255,.08);backdrop-filter:blur(14px);',
+    'opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;z-index:20;box-shadow:0 10px 34px rgba(0,0,0,.55)}',
+    '.toast.on{opacity:1;transform:translate(-50%,0)}',
+    '.pg{position:fixed;left:16px;right:16px;bottom:150px;background:rgba(20,22,27,.9);border-radius:13px;padding:12px 14px;',
+    'z-index:21;color:#e9ebef;font:12.5px/1.4 -apple-system,sans-serif;display:none;',
+    'border:1px solid rgba(255,255,255,.07);backdrop-filter:blur(14px);box-shadow:0 8px 28px rgba(0,0,0,.55)}',
+    '.pg.on{display:block}',
+    '.pg .row{display:flex;align-items:center;gap:10px;margin-bottom:8px}',
+    '.pg .row span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.pg .row button{background:rgba(255,255,255,.1);border:0;color:#cfd5de;border-radius:7px;padding:4px 9px;',
+    'font-size:11.5px;transition:transform .12s,background .15s}',
+    '.pg .row button:active{transform:scale(.95);background:rgba(255,255,255,.18)}',
+    '.pg .track{height:4px;border-radius:2px;background:rgba(255,255,255,.12);overflow:hidden}',
+    '.pg .fill{height:100%;width:0;background:linear-gradient(90deg,#ff8cab,#fb7299);transition:width .25s linear}',
+    '.pg .sub{font-size:11px;color:#8b93a1;margin-bottom:8px}',
+    '.pg .sub:empty{display:none}',
+    '.set{position:fixed;left:0;right:0;bottom:0;background:#16181d;color:#e9ebef;border-radius:18px 18px 0 0;z-index:12;',
+    'transform:translateY(105%);transition:transform .24s cubic-bezier(.2,.85,.25,1);pointer-events:auto;',
+    'max-height:78vh;display:flex;flex-direction:column;padding-bottom:calc(10px + env(safe-area-inset-bottom))}',
+    '.set.open{transform:translateY(0)}',
+    '.set .hd{display:flex;align-items:center;gap:8px;padding:14px 16px 10px;border-bottom:1px solid rgba(255,255,255,.07)}',
+    '.set .hd h3{margin:0;font-size:15px;font-weight:600;flex:1}',
+    '.set .hd button{background:rgba(255,255,255,.1);border:0;color:#cfd5de;border-radius:9px;padding:7px 14px;font-size:12.5px}',
+    '.set .sbody{padding:4px 16px 8px;overflow-y:auto;-webkit-overflow-scrolling:touch}',
+    '.srow{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 0;',
+    'border-bottom:1px solid rgba(255,255,255,.05);font-size:13.5px;color:#dfe4ec}',
+    '.srow:last-child{border-bottom:0}',
+    '.srow.col{flex-direction:column;align-items:stretch;gap:10px}',
+    '.srow.col>span{color:#aeb6c2;font-size:12.5px}',
+    '.sw{width:44px;height:26px;border-radius:13px;background:rgba(255,255,255,.16);position:relative;flex:none;transition:background .2s}',
+    '.sw::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;transition:left .2s}',
+    '.sw.on{background:#fb7299}',
+    '.sw.on::after{left:21px}',
+    '.seg{display:flex;gap:8px}',
+    '.seg button{flex:1;height:36px;border-radius:9px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.06);',
+    'color:#cfd5de;font-size:12.5px;transition:background .15s}',
+    '.seg button.on{background:linear-gradient(135deg,#ff8cab,#fb7299);border-color:transparent;color:#fff;font-weight:600}',
+    '.sgrp{margin:16px 0 2px;font-size:11px;color:#7a8290;font-weight:600;letter-spacing:2px}',
+    '.sbody .sgrp:first-child{margin-top:4px}',
+    '.srow .cwrap{display:flex;align-items:center;gap:10px}',
+    '.srow .csz{font-style:normal;color:#8b93a1;font-size:12px}',
+    '.srow .mini{height:28px;padding:0 12px;border-radius:8px;border:1px solid rgba(255,255,255,.14);',
+    'background:rgba(255,255,255,.07);color:#cfd5de;font-size:12px}',
+    '@media (max-width:400px){',
+    '.pl .ctlrow{gap:5px}',
+    '.pl .ctlrow .stat{font-size:9px;max-width:60px}',
+    '.pl .ctlrow .tm{font-size:10.5px}',
+    '.pl .ctlrow button[data-a="q"]{padding:0 7px}',
+    '}',
+    '@media (orientation:landscape){',
+    '.pl .top{padding:calc(6px + env(safe-area-inset-top)) calc(16px + env(safe-area-inset-right)) 6px calc(16px + env(safe-area-inset-left))}',
+    '.pl .ctl{padding:22px calc(18px + env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) calc(18px + env(safe-area-inset-left))}',
+    '.pl .side{right:calc(14px + env(safe-area-inset-right));bottom:calc(84px + env(safe-area-inset-bottom))}',
+    '.pl .seek{height:30px}',
+    '.pl .seek .tip{bottom:27px}',
+    '.pl .bigplay{width:64px;height:64px;margin:-32px 0 0 -32px}',
+    '.pl .bigplay svg{width:30px;height:30px}',
+    '.pl .pmenu{bottom:calc(56px + env(safe-area-inset-bottom))}',
+    '}'
+  ].join('');
+
+  function buildUI() {
+    if (ui) return ui;
+    if (!document.documentElement) return null;
+
+    var host = document.createElement('div');
+    host.id = '__xb_video_kit__';
+    host.style.cssText = 'all:initial;position:fixed;top:0;left:0;right:0;bottom:0;pointer-events:none;z-index:2147483647;';
+    var root = null;
+    if (host.attachShadow) {
+      buildingUI = true;
+      try { root = host.attachShadow({ mode: 'open' }); } finally { buildingUI = false; }
+    }
+    if (!root) return null;
+
+    var style = document.createElement('style');
+    style.textContent = CSS;
+    root.appendChild(style);
+
+    fabEl = document.createElement('div');
+    fabEl.className = 'fab';
+    fabEl.innerHTML =
+      '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="#e9ebef" stroke-width="1.8">' +
+      '<rect x="2.6" y="4.6" width="18.8" height="14.8" rx="3.2"/>' +
+      '<path d="M10.2 9.3l5 2.7-5 2.7z" fill="#e9ebef" stroke="none"/></svg>' +
+      '<span class="lb">视频</span>' +
+      '<i class="dot">0</i>' +
+      '<b class="tip">点我播放 · 长按列表</b>';
+    fabEl.style.right = '14px';
+    fabEl.style.bottom = '150px';
+    if (pos) {
+      var px = Math.max(4, Math.min(window.innerWidth - 80, pos.x));
+      var py = Math.max(4, Math.min(window.innerHeight - 50, pos.y));
+      fabEl.style.left = px + 'px';
+      fabEl.style.top = py + 'px';
+      fabEl.style.right = 'auto';
+      fabEl.style.bottom = 'auto';
+    }
+    root.appendChild(fabEl);
+
+    var mask = document.createElement('div');
+    mask.className = 'mask';
+    root.appendChild(mask);
+
+    sheetEl = document.createElement('div');
+    sheetEl.className = 'sheet';
+    sheetEl.innerHTML =
+      '<div class="hd"><h3>视频提取</h3><span class="cnt"></span>' +
+      '<button data-a="set">设置</button><button data-a="rescan">重扫</button><button data-a="close">收起</button></div>' +
+      '<div class="tabs"><button data-a="tab" data-v="video" class="on">视频</button>' +
+      '<button data-a="tab" data-v="dl">下载<b class="dnum"></b></button></div>' +
+      '<div class="hint">点「播放」用内置播放器 · 点「下载」存入下载管理</div>' +
+      '<div class="list"></div>' +
+      '<div class="dlist"></div>' +
+      '<div class="ft"><button data-a="rec">录制当前画面</button><i class="ver">v' + VERSION + '</i></div>';
+    root.appendChild(sheetEl);
+
+    tvEl = document.createElement('div');
+    tvEl.className = 'vw';
+    tvEl.innerHTML =
+      '<div class="vhd"><button data-a="vback">' + ICON.back + '</button><span class="vt"></span>' +
+      '<button data-a="vshare">分享</button></div><pre class="vbody"></pre>';
+    root.appendChild(tvEl);
+
+    ivEl = document.createElement('div');
+    ivEl.className = 'vw';
+    ivEl.innerHTML =
+      '<div class="vhd"><button data-a="vback">' + ICON.back + '</button><span class="vt"></span>' +
+      '<button data-a="vshare">分享</button></div><div class="vimgw"><img alt=""></div>';
+    root.appendChild(ivEl);
+
+    setEl = document.createElement('div');
+    setEl.className = 'set';
+    setEl.innerHTML =
+      '<div class="hd"><h3>设置</h3><button data-a="close">完成</button></div>' +
+      '<div class="sbody">' +
+      '<div class="sgrp">播 放</div>' +
+      '<div class="srow"><span>自动接管网页播放器</span><b class="sw" data-k="autoTakeover"></b></div>' +
+      '<div class="srow"><span>画面手势（拖动/双击/长按/音量亮度）</span><b class="sw" data-k="gestures"></b></div>' +
+      '<div class="sgrp">进 度</div>' +
+      '<div class="srow"><span>记忆播放进度</span><b class="sw" data-k="resume"></b></div>' +
+      '<div class="srow col"><span>跳过片头</span><div class="seg" data-k="skipIntro">' +
+      '<button data-v="0">关</button><button data-v="5">5 秒</button><button data-v="10">10 秒</button><button data-v="20">20 秒</button>' +
+      '</div></div>' +
+      '<div class="srow col"><span>默认倍速</span><div class="seg" data-k="speed">' +
+      '<button data-v="1">1.0x</button><button data-v="1.25">1.25x</button><button data-v="1.5">1.5x</button><button data-v="2">2.0x</button>' +
+      '</div></div>' +
+      '<div class="sgrp">缓 存</div>' +
+      '<div class="srow"><span>边看边缓存</span><b class="sw" data-k="segCache"></b></div>' +
+      '<div class="srow"><span>缓存占用</span><div class="cwrap"><i class="csz">0 MB</i>' +
+      '<button data-a="clearcache" class="mini">清空</button></div></div>' +
+      '</div>';
+    root.appendChild(setEl);
+    listEl = sheetEl.querySelector('.list');
+    dlistEl = sheetEl.querySelector('.dlist');
+
+    playerEl = document.createElement('div');
+    playerEl.className = 'pl';
+    playerEl.innerHTML =
+      '<div class="stage">' +
+      '<video playsinline webkit-playsinline preload="auto"></video>' +
+      '<canvas class="freeze"></canvas>' +
+      '<div class="dim"></div>' +
+      '<div class="spin"></div>' +
+      '<div class="bigplay"><span class="bp-play">' + ICON.bigplay + '</span><span class="bp-replay">' + ICON.replay + '</span></div>' +
+      '<div class="seekpreview"><b>0:00</b><i>+0:00</i><span class="bar"><em></em></span></div>' +
+      '<i class="mtrack"><b></b></i>' +
+      '</div>' +
+      '<div class="top"><button data-a="close">' + ICON.back + '</button><div class="t"></div>' +
+      '<button data-a="full" class="mfull">' + ICON.full + '</button></div>' +
+      '<div class="side">' +
+      '<button data-a="dl">' + ICON.dl + '<i>下载</i></button>' +
+      '<button data-a="pip">' + ICON.pip + '<i>画中画</i></button>' +
+      '<button data-a="list">' + ICON.list + '<i>列表</i></button>' +
+      '</div>' +
+      '<div class="ctl">' +
+      '<div class="seek"><i class="track"></i><i class="buf"></i><i class="bar"></i><b class="knob"></b><span class="tip">0:00</span></div>' +
+      '<div class="ctlrow">' +
+      '<button data-a="toggle" class="ico">' + ICON.play + '</button>' +
+      '<span class="tm">0:00 / 0:00</span>' +
+      '<span class="stat"></span>' +
+      '<span class="sp"></span>' +
+      '<button data-a="speed">1.0x</button>' +
+      '<button data-a="q" style="display:none">清晰度</button>' +
+      '<button data-a="mute" class="ico">' + ICON.vol + '</button>' +
+      '<button data-a="full" class="ico">' + ICON.full + '</button>' +
+      '</div></div>' +
+      '<div class="pmask"></div>' +
+      '<div class="pmenu"><div class="pmt"></div><div class="pmbody"></div></div>';
+    root.appendChild(playerEl);
+    videoEl = playerEl.querySelector('video');
+
+    toastEl = document.createElement('div');
+    toastEl.className = 'toast';
+    root.appendChild(toastEl);
+
+    progressEl = document.createElement('div');
+    progressEl.className = 'pg';
+    progressEl.innerHTML =
+      '<div class="row"><span class="txt">准备中…</span><button data-a="cancel">取消</button></div>' +
+      '<div class="sub"></div>' +
+      '<div class="track"><i class="fill"></i></div>';
+    root.appendChild(progressEl);
+
+    document.documentElement.appendChild(host);
+    ui = { host: host, root: root, mask: mask };
+
+    bindUI();
+    return ui;
+  }
+
+  function fmtTime(s) {
+    if (!isFinite(s) || s < 0) s = 0;
+    var m = Math.floor(s / 60), sec = Math.floor(s % 60);
+    return m + ':' + (sec < 10 ? '0' : '') + sec;
+  }
+  function playerOff() { return (hls && hls.ptsOffset) || 0; }
+  function curPos() { return Math.max(0, ((videoEl && videoEl.currentTime) || 0) - playerOff()); }
+
+  function posKey(it) {
+    if (it && it.pkey) return it.pkey;      // 下载管理里的文件：blob URL 每次都变，用固定 id
+    var u = (it && it.url) || '';
+    return 'xbvk.p:' + u.slice(0, 400);
+  }
+  function savePlayPos(it, sec) {
+    if (!it || !sec || sec < 5) return;
+    try {
+      localStorage.setItem(posKey(it), String(Math.round(sec)));
+      if (++posSavedCount % 25 === 0) prunePlayPos();
+    } catch (e) {}
+  }
+
+  var posSavedCount = 0;
+  function prunePlayPos() {
+    try {
+      var keys = [], i, k;
+      for (i = 0; i < localStorage.length; i++) {
+        k = localStorage.key(i);
+        if (k && k.indexOf('xbvk.p:') === 0) keys.push(k);
+      }
+      if (keys.length <= 150) return;
+      for (i = 0; i < keys.length - 120; i++) localStorage.removeItem(keys[i]);
+    } catch (e) {}
+  }
+  function loadPlayPos(it) {
+    if (!it) return 0;
+    try {
+      var v = parseInt(localStorage.getItem(posKey(it)) || '0', 10);
+      return (v > 5 && v < 100000) ? v : 0;
+    } catch (e) { return 0; }
+  }
+  function playerDur() {
+    var d = videoEl && videoEl.duration;
+    if (!d || !isFinite(d) || d <= 0) return 0;
+    return Math.max(0, d - playerOff());
+  }
+  var freezeOn = false;
+  function showFreeze() {
+    var v = videoEl;
+    if (!v || !v.videoWidth || !v.videoHeight || !playerEl) return;
+    var c = playerEl.querySelector('.freeze');
+    if (!c) return;
+    try {
+      if (c.width !== v.videoWidth) c.width = v.videoWidth;
+      if (c.height !== v.videoHeight) c.height = v.videoHeight;
+      var ctx = c.getContext('2d');
+      if (!ctx) return;
+      ctx.drawImage(v, 0, 0, c.width, c.height);
+      c.style.display = 'block';
+      freezeOn = true;
+    } catch (e) {}
+  }
+  function hideFreeze() {
+    if (!freezeOn) return;
+    freezeOn = false;
+    if (!playerEl) return;
+    var c = playerEl.querySelector('.freeze');
+    if (c) c.style.display = 'none';
+  }
+  var pctl = null;
+  function pctlNodes() {
+    if (!pctl && playerEl) {
+      pctl = {
+        bar: playerEl.querySelector('.seek .bar'),
+        knob: playerEl.querySelector('.seek .knob'),
+        buf: playerEl.querySelector('.seek .buf'),
+        tm: playerEl.querySelector('.tm'),
+        tip: playerEl.querySelector('.seek .tip'),
+        toggle: playerEl.querySelector('.ctlrow [data-a="toggle"]'),
+        mfill: playerEl.querySelector('.mtrack b')   // 小窗模式的细进度线
+      };
+    }
+    return pctl;
+  }
+
+  var smoothRaf = 0;
+  function rafNext(fn) {
+    if (window.requestAnimationFrame) return window.requestAnimationFrame(fn);
+    return setTimeout(fn, 16);
+  }
+  function smoothTick() {
+    if (!playerOpen || !videoEl || videoEl.paused) { smoothRaf = 0; return; }
+    if (!seekBusy() && !seekUI.pending && !videoEl.seeking) {
+      var n = pctlNodes();
+      if (n) {
+        var dur = playerDur() || seekUI.lastDur;
+        var pos = Math.max(0, (videoEl.currentTime || 0) - playerOff());
+        var pct = dur ? Math.min(1, Math.max(0, pos / dur)) : 0;
+        n.bar.style.width = (pct * 100).toFixed(3) + '%';
+        n.knob.style.left = (pct * 100).toFixed(3) + '%';
+        if (n.mfill) n.mfill.style.width = (pct * 100).toFixed(3) + '%';
+        n.tm.textContent = fmtTime(pos) + ' / ' + fmtTime(dur);
+      }
+    }
+    smoothRaf = rafNext(smoothTick);
+  }
+  function startSmooth() {
+    if (smoothRaf) return;
+    smoothRaf = rafNext(smoothTick);
+  }
+  function stopSmooth() {
+    if (!smoothRaf) return;
+    try { cancelAnimationFrame(smoothRaf); } catch (e) {}
+    try { clearTimeout(smoothRaf); } catch (e) {}
+    smoothRaf = 0;
+  }
+
+  function syncProgress() {
+    if (!playerOpen || !playerEl || !videoEl) return;
+    if (seekBusy()) return;      // 手指按在进度条上时，播放事件不许改滑块
+
+    var dur = playerDur();
+    if (dur > 0) seekUI.lastDur = dur;
+    var pos = Math.max(0, (videoEl.currentTime || 0) - playerOff());
+    var wasPending = seekUI.pending;
+
+    if (seekUI.pending) {
+      var want = seekUI.target;
+      var near = dur > 0 && !videoEl.seeking && Math.abs(pos - want) < 1.0;
+      if (near || Date.now() - seekUI.pendingAt > 10000) {
+        seekUI.pending = false;                   // 到位了（或等太久），恢复跟播放走
+      } else {
+        pos = want;
+        dur = dur || seekUI.lastDur;
+      }
+    }
+    if (wasPending && !seekUI.pending) showUI();
+
+    if (!forcedEnded && hls && hls.finished && !seekUI.pending && dur > 0 &&
+        !videoEl.paused && !videoEl.ended && videoEl.readyState < 3 && dur - pos < 0.7) {
+      forcedEnded = true;
+      try { videoEl.pause(); } catch (e) {}
+      showUI();
+    }
+
+    var pct = dur ? Math.min(1, Math.max(0, pos / dur)) : 0;
+
+    var n = pctlNodes();
+    if (!n) return;
+    n.bar.style.width = (pct * 100).toFixed(2) + '%';
+    n.knob.style.left = (pct * 100).toFixed(2) + '%';
+    if (n.mfill) n.mfill.style.width = (pct * 100).toFixed(2) + '%';
+
+    var end = 0;
+    try {
+      var b = videoEl.buffered;
+      for (var i = 0; i < b.length; i++) {
+        if (b.start(i) <= videoEl.currentTime + 0.6) end = Math.max(end, b.end(i));
+      }
+    } catch (e) {}
+    var bp = dur ? Math.min(1, Math.max(0, (end - playerOff()) / dur)) : 0;
+    n.buf.style.width = (bp * 100).toFixed(2) + '%';
+    n.tm.textContent = fmtTime(pos) + ' / ' + fmtTime(dur);
+    n.toggle.innerHTML = videoEl.paused ? ICON.play : ICON.pause;
+    playerEl.classList.toggle('paused', !!videoEl.paused);
+    playerEl.classList.toggle('ended', !!videoEl.ended || forcedEnded);
+    if (!seekUI.pending) { seekUI.hard = false; }
+    playerEl.classList.toggle('seeking', !!seekUI.pending && (seekUI.hard || !!(hls && (hls.softSeek || hls.restarting))));
+    if (!seekUI.pending) hideFreeze();
+  }
+  function togglePlay() {
+    if (!videoEl) return;
+    if (forcedEnded) {
+      forcedEnded = false;
+      try { videoEl.currentTime = playerOff(); } catch (e) {}
+    }
+    if (videoEl.paused) {
+      userPaused = false;
+      if (videoEl.ended) { try { videoEl.currentTime = playerOff(); } catch (e) {} }
+      safePlay(videoEl);
+    } else {
+      userPaused = true;
+      try { videoEl.pause(); } catch (e) {}
+    }
+    setTimeout(syncProgress, 40);
+  }
+  var uiHideTimer = 0;
+  var lastSaveAt = 0;
+  var loadTimer = 0;
+  var brightVal = 1;   // 画面亮度（0~1），用黑色蒙层模拟
+
+  function applyBright() {
+    var d = playerEl && playerEl.querySelector('.dim');
+    if (d) d.style.opacity = String(((1 - brightVal) * 0.85).toFixed(3));
+  }
+  var seekUI = {
+    dragging: false, gesture: false,
+    ratio: 0, target: 0,
+    pending: false, pendingAt: 0,
+    lastDur: 0, touchId: null, lastTouchAt: 0,
+    hard: false
+  };
+  function seekBusy() { return seekUI.dragging || seekUI.gesture; }
+  function resetSeekUI() {
+    seekUI.dragging = false;
+    seekUI.gesture = false;
+    seekUI.pending = false;
+    seekUI.pendingAt = 0;
+    seekUI.ratio = 0;
+    seekUI.target = 0;
+    seekUI.lastDur = 0;
+    seekUI.touchId = null;
+    seekUI.hard = false;
+    if (playerEl) playerEl.classList.remove('seeking');
+    hideFreeze();
+  }
+  function showUI() {
+    if (!playerEl) return;
+    playerEl.classList.remove('hideui');
+    clearTimeout(uiHideTimer);
+    var mini = playerEl.classList.contains('mini');
+    uiHideTimer = setTimeout(function () {
+      if (seekBusy() || seekUI.pending || menuOpen) return;   // 拖动/跳转/弹层打开时不要藏控件
+      if (playerOpen && videoEl && !videoEl.paused && (mini || !playerEl.classList.contains('embed'))) {
+        playerEl.classList.add('hideui');
+      }
+    }, mini ? 1600 : 3200);
+  }
+
+  function fmtSpeed(n) {
+    return Number(n).toFixed(2).replace(/0$/, '') + 'x';
+  }
+
+  function escHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c === '"' ? '&quot;' : '&#39;';
+    });
+  }
+
+  function closeMenus(quiet) {
+    menuOpen = false;
+    if (playerEl) {
+      var m = playerEl.querySelector('.pmenu');
+      var mk = playerEl.querySelector('.pmask');
+      if (m) m.classList.remove('on');
+      if (mk) mk.classList.remove('on');
+      var on = playerEl.querySelectorAll('.ctlrow button.on');
+      for (var i = 0; i < on.length; i++) on[i].classList.remove('on');
+    }
+    if (!quiet) showUI();
+  }
+
+  function openMenu(kind, anchor) {
+    if (!playerEl) return;
+    closeMenus(true);
+    var menu = playerEl.querySelector('.pmenu');
+    var mask = playerEl.querySelector('.pmask');
+    var title = playerEl.querySelector('.pmenu .pmt');
+    var body = playerEl.querySelector('.pmenu .pmbody');
+    if (!menu || !body || !title) return;
+
+    var html = '';
+    if (kind === 'speed') {
+      title.textContent = '播放速度';
+      menu.classList.add('grid');
+      for (var i = 0; i < SPEEDS.length; i++) {
+        html += '<button data-a="spd" data-v="' + SPEEDS[i] + '"' +
+          (i === speedIdx ? ' class="on"' : '') + '>' + fmtSpeed(SPEEDS[i]) + '</button>';
+      }
+    } else {
+      var vs = (hls && hls.variants) || [];
+      if (vs.length < 2) return;
+      title.textContent = '清晰度';
+      menu.classList.remove('grid');
+      for (var j = 0; j < vs.length; j++) {
+        var lab = (vs[j] && vs[j].label) || ('清晰度 ' + (j + 1));
+        html += '<button data-a="qsel" data-v="' + j + '" data-l="' + escHtml(lab) + '"' +
+          (j === (hls.variantIndex || 0) ? ' class="on"' : '') + '>' + escHtml(lab) + '</button>';
+      }
+    }
+    body.innerHTML = html;
+    menu.classList.add('on');
+    if (mask) mask.classList.add('on');
+    menuOpen = true;
+    if (anchor) anchor.classList.add('on');
+    showUI();
+  }
+  function exitFull() {
+    try { if (window.screen && screen.orientation && screen.orientation.unlock) screen.orientation.unlock(); } catch (e) {}
+    var ex = document.exitFullscreen || document.webkitExitFullscreen;
+    if (!ex) return;
+    try {
+      var p = ex.call(document);
+      if (p && p.catch) p.catch(function () {});
+    } catch (e) {}
+  }
+  var preFullSource = null;   // 进全屏前的嵌入目标，退出全屏要回到原位
+  function togglePip() {
+    if (!videoEl) return;
+    try {
+      if (document.pictureInPictureElement) {
+        var p0 = document.exitPictureInPicture();
+        if (p0 && p0.catch) p0.catch(function () {});
+        return;
+      }
+      if (!videoEl.requestPictureInPicture) { toast('这个浏览器不支持画中画'); return; }
+      var p = videoEl.requestPictureInPicture();
+      if (p && p.catch) p.catch(function () { toast('画中画打不开（可能要等画面出来）'); });
+    } catch (e) { toast('画中画不可用'); }
+  }
+
+  function setMediaMeta(it) {
+    if (!navigator.mediaSession || !window.MediaMetadata) return;
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: (it && it.title) || '视频',
+        artist: location.hostname || '',
+        album: '视频提取'
+      });
+    } catch (e) {}
+  }
+
+  function toggleFull() {
+    var isFull = document.fullscreenElement || document.webkitFullscreenElement;
+    if (isFull) { exitFull(); return; }
+
+    if (playerEl.classList.contains('embed')) {
+      preFullSource = embedTarget;
+      playerEl.classList.remove('embed');
+      playerEl.classList.remove('mini');
+      playerEl.style.cssText = '';
+      embedTarget = null;
+      try {
+        window.removeEventListener('scroll', syncEmbed, true);
+        window.removeEventListener('resize', syncEmbed);
+      } catch (e) {}
+      syncProgress();
+    }
+
+    var fsEl = document.getElementById('__xb_video_kit__') || playerEl;
+    var req = fsEl.requestFullscreen || fsEl.webkitRequestFullscreen;
+    if (req) {
+      try { var p = req.call(fsEl); if (p && p.catch) p.catch(function () {}); } catch (e) {}
+    }
+    setTimeout(function () {
+      try {
+        if (window.screen && screen.orientation && screen.orientation.lock) {
+          var r = screen.orientation.lock('landscape');
+          if (r && r.catch) {
+            r.catch(function () { toast('这个浏览器不支持自动横屏，请手动旋转手机'); });
+          }
+        }
+      } catch (e) {}
+    }, 200);
+    showUI();
+  }
+
+  function bindUI() {
+    var sx = 0, sy = 0, ox = 0, oy = 0, moved = false, dragging = false;
+    var pressTimer = 0, lastTap = 0;
+    var TAP_SLOP = 14;
+
+    function tapFab() {
+      var now = Date.now();
+      if (now - lastTap < 400) return;      // 防止 touchend + click 双重触发
+      lastTap = now;
+      if (playerOpen) return;               // 播放器已经开着，别重复起播
+      try { quickPlay(); } catch (err) { toast('播放器打不开：' + ((err && err.message) || '未知错误')); }
+    }
+
+    function pressStart(x, y) {
+      dragging = true; moved = false;
+      var r = fabEl.getBoundingClientRect();
+      sx = x; sy = y; ox = r.left; oy = r.top;
+      fabEl.classList.add('press');
+      clearTimeout(pressTimer);
+      pressTimer = setTimeout(function () {
+        if (dragging && !moved) {
+          dragging = false;
+          fabEl.classList.remove('press');
+          lastTap = Date.now();          // 让随后的 tap 被去重挡掉
+          try { openSheet(); } catch (err) {}
+        }
+      }, 550);
+    }
+
+    function pressEnd(x, y) {
+      clearTimeout(pressTimer);
+      fabEl.classList.remove('press');
+      if (!dragging) { tapFab(); return; }   // 没收到 touchstart 也当成点击，别把事件丢了
+      dragging = false;
+      var dx = (x == null) ? 0 : Math.abs(x - sx);
+      var dy = (y == null) ? 0 : Math.abs(y - sy);
+      if (moved && (dx + dy) > TAP_SLOP) {
+        var r = fabEl.getBoundingClientRect();
+        savePos(Math.round(r.left), Math.round(r.top));
+      } else {
+        moved = false;
+        tapFab();
+      }
+    }
+
+    fabEl.addEventListener('touchstart', function (e) {
+      if (!e.touches[0]) return;
+      pressStart(e.touches[0].clientX, e.touches[0].clientY);
+    }, { passive: true });
+
+    fabEl.addEventListener('touchmove', function (e) {
+      if (!dragging || !e.touches[0]) return;
+      var dx = e.touches[0].clientX - sx;
+      var dy = e.touches[0].clientY - sy;
+      if (!moved && Math.abs(dx) + Math.abs(dy) > TAP_SLOP) {
+        moved = true;
+        clearTimeout(pressTimer);
+      }
+      if (!moved) return;
+      var bw = fabEl.offsetWidth || 70, bh = fabEl.offsetHeight || 42;
+      var x = Math.max(4, Math.min(window.innerWidth - bw - 4, ox + dx));
+      var y = Math.max(4, Math.min(window.innerHeight - bh - 4, oy + dy));
+      fabEl.style.left = x + 'px';
+      fabEl.style.top = y + 'px';
+      fabEl.style.right = 'auto';
+      fabEl.style.bottom = 'auto';
+      e.preventDefault();
+    }, { passive: false });
+
+    fabEl.addEventListener('touchend', function (e) {
+      var t = e.changedTouches && e.changedTouches[0];
+      pressEnd(t ? t.clientX : null, t ? t.clientY : null);
+    }, { passive: true });
+
+    fabEl.addEventListener('touchcancel', function () {
+      clearTimeout(pressTimer);
+      fabEl.classList.remove('press');
+      dragging = false;
+      moved = false;
+    }, { passive: true });
+
+    fabEl.addEventListener('click', function (e) {
+      if (moved) { e.stopPropagation(); e.preventDefault(); return; }
+      tapFab();
+    });
+
+    ui.mask.addEventListener('click', function () {
+      if (Date.now() < uiGuardUntil) return;
+      if (settingsOpen) { closeSettings(); return; }
+      closeSheet();
+    });
+
+    if (setEl) {
+      setEl.addEventListener('click', function (e) {
+        if (Date.now() < uiGuardUntil) return;
+        var t = e.target;
+        if (!t || !t.getAttribute) return;
+        if (t.getAttribute('data-a') === 'close') { closeSettings(); return; }
+        if (t.getAttribute('data-a') === 'clearcache') {
+          segCache.clear();
+          segCacheBytes = 0;
+          renderSettings();
+          toast('缓存已清空');
+          return;
+        }
+
+        if (t.classList && t.classList.contains('sw')) {
+          var k = t.getAttribute('data-k');
+          cfg[k] = !cfg[k];
+          if (k === 'segCache' && !cfg[k]) {
+            segCache.clear();
+            segCacheBytes = 0;
+          }
+          saveCfg(); renderSettings(); applyCfg();
+          if (k === 'autoTakeover') toast(cfg.autoTakeover ? '已开启自动接管' : '已关闭自动接管');
+          if (k === 'segCache') toast(cfg[k] ? '已开启缓存' : '已关闭缓存，内存已释放');
+          return;
+        }
+        if (t.tagName === 'BUTTON' && t.getAttribute('data-v') !== null &&
+            t.parentNode && t.parentNode.classList && t.parentNode.classList.contains('seg')) {
+          var kk = t.parentNode.getAttribute('data-k');
+          cfg[kk] = Number(t.getAttribute('data-v'));
+          saveCfg(); renderSettings(); applyCfg();
+        }
+      });
+    }
+
+    sheetEl.addEventListener('click', function (e) {
+      if (Date.now() < uiGuardUntil) return;
+      var t = e.target;
+      while (t && t !== sheetEl && t.tagName !== 'BUTTON') t = t.parentNode;
+      if (!t || t === sheetEl) return;
+      var a = t.getAttribute('data-a');
+      if (a === 'close') return closeSheet();
+      if (a === 'set') return openSettings();
+      if (a === 'rescan') { scanDom(); scanPerf(); toast('已重新扫描'); return; }
+      if (a === 'rec') return startRecord();
+      if (a === 'tab') {
+        var isDl = t.getAttribute('data-v') === 'dl';
+        dlTabOpen = isDl;
+        sheetEl.classList.toggle('dltab', isDl);
+        var tbs = sheetEl.querySelectorAll('.tabs button');
+        for (var ti = 0; ti < tbs.length; ti++) tbs[ti].classList.toggle('on', tbs[ti] === t);
+        if (isDl) { dlInit().then(renderDownloads); }
+        return;
+      }
+
+      var row = t.closest('.it');
+      if (!row) return;
+      var id = parseInt(row.getAttribute('data-id'), 10);
+      var it = null;
+      items.forEach(function (v) { if (v.id === id) it = v; });
+      if (!it) return;
+
+      var act = t.getAttribute('data-act');
+      if (act === 'play') playItem(it);
+      else if (act === 'dl') downloadItem(it);
+      else if (act === 'copy') copyText(it.url);
+    });
+
+    if (dlistEl) {
+      dlistEl.addEventListener('click', function (e) {
+        var t = e.target;
+        while (t && t !== dlistEl && t.tagName !== 'BUTTON') t = t.parentNode;
+        if (!t || t === dlistEl) return;
+        var act = t.getAttribute('data-act');
+
+        if (act === 'clearall') {
+          dlClearAll().then(function () {
+            toast('下载管理已清空');
+            renderDownloads();
+          });
+          return;
+        }
+
+        // 未完成任务：继续 / 删除
+        var taskRowEl = t.closest('.dtask');
+        if (taskRowEl) {
+          var tid = taskRowEl.getAttribute('data-tid');
+          var tk = null;
+          for (var q = 0; q < dlTasks.length; q++) {
+            if (dlTasks[q].id === tid) { tk = dlTasks[q]; break; }
+          }
+          if (!tk) return;
+          if (act === 'tdel') {
+            taskRemove(tid).then(function () {
+              toast('已删除任务');
+              renderDownloads();
+            });
+          } else if (act === 'go') {
+            if (dlActive > 0) { toast('已有下载任务在进行'); return; }
+            closeSheet();
+            var fakeIt = { url: tk.url, title: tk.name, kind: 'mp4' };
+            if (tk.kind === 'hls') downloadHls(fakeIt, tk);
+            else downloadItem(fakeIt, tk);
+          }
+          return;
+        }
+
+        var rowEl = t.closest('.dit');
+        if (!rowEl) return;
+        var fid = rowEl.getAttribute('data-id');
+        var f = null;
+        dlMan.files.forEach(function (x) { if (x.id === fid) f = x; });
+        if (!f) return;
+
+        if (act === 'del') {
+          dlRemove(f).then(function () {
+            toast('已删除');
+            renderDownloads();
+          });
+        } else if (act === 'share') {
+          dlGetBlob(f).then(function (b) { shareFile(b, f.name, f.mime); },
+            function () { toast('文件读取失败'); });
+        } else if (act === 'play') {
+          dlGetBlob(f).then(function (b) { playDlFile(f, b); },
+            function (err) { toast((err && err.message) || '文件读取失败'); });
+        } else if (act === 'view') {
+          dlGetBlob(f).then(function (b) {
+            if (dlKindOf(f.name, f.mime) === 'img') viewImage(f, b);
+            else viewText(f, b);
+          }, function (err) { toast((err && err.message) || '文件读取失败'); });
+        }
+      });
+    }
+
+    function bindViewer(el) {
+      el.addEventListener('click', function (e) {
+        var t = e.target;
+        while (t && t !== el && t.tagName !== 'BUTTON') t = t.parentNode;
+        if (!t || t === el) return;
+        var a = t.getAttribute('data-a');
+        if (a === 'vback') closeViewer();
+        else if (a === 'vshare' && viewerFile && viewerBlob) {
+          shareFile(viewerBlob, viewerFile.name, viewerFile.mime);
+        }
+      });
+    }
+    if (tvEl) bindViewer(tvEl);
+    if (ivEl) bindViewer(ivEl);
+
+    var pmaskEl = playerEl.querySelector('.pmask');
+    if (pmaskEl) {
+      pmaskEl.addEventListener('click', function (e) {
+        e.stopPropagation();
+        closeMenus();
+      });
+    }
+
+    playerEl.addEventListener('click', function (e) {
+      if (Date.now() < uiGuardUntil) return;
+      var el = e.target;
+      while (el && el !== playerEl && !(el.getAttribute && el.getAttribute('data-a'))) el = el.parentNode;
+      var a = (el && el.getAttribute) ? el.getAttribute('data-a') : null;
+      if (!a) return;
+
+      if (a === 'close') closePlayer();
+      else if (a === 'list') {
+        playerHiddenForSheet = true;
+        closeMenus(true);
+        exitFull();                 // 全屏下底部列表不好看，先退出来
+        playerEl.classList.remove('open');
+        try { if (siteVideo) siteVideo.style.visibility = 'hidden'; } catch (e) {}
+        openSheet();
+      }
+      else if (a === 'toggle') togglePlay();
+      else if (a === 'full') toggleFull();
+      else if (a === 'pip') togglePip();
+      else if (a === 'mute') {
+        videoEl.muted = !videoEl.muted;
+        el.innerHTML = videoEl.muted ? ICON.mute : ICON.vol;
+      }
+      else if (a === 'speed') {
+        openMenu('speed', el);
+      } else if (a === 'q') {
+        openMenu('quality', el);
+      } else if (a === 'spd') {
+        var sv = parseFloat(el.getAttribute('data-v'));
+        var si = SPEEDS.indexOf(sv);
+        if (si >= 0) {
+          speedIdx = si;
+          try { videoEl.playbackRate = SPEEDS[si]; } catch (e) {}
+          var spb = playerEl.querySelector('[data-a="speed"]');
+          if (spb) spb.textContent = fmtSpeed(SPEEDS[si]);
+          toast('倍速 ' + SPEEDS[si] + 'x');
+        }
+        closeMenus();
+      } else if (a === 'qsel') {
+        var qi = parseInt(el.getAttribute('data-v'), 10);
+        var qlab = el.getAttribute('data-l') || '';
+        closeMenus();
+        if (!hls || isNaN(qi) || qi === (hls.variantIndex || 0)) return;
+        var qb = playerEl.querySelector('[data-a="q"]');
+        if (qb) qb.textContent = qlab || '清晰度';
+        toast('切换到 ' + (qlab || '清晰度'));
+        hls.switchTo(qi).then(function () {
+          if (hls) updateQualityBtn(hls);
+        }, function () {
+          toast('切换失败');
+          if (hls) updateQualityBtn(hls);
+        });
+      } else if (a === 'dl' && current) {
+        var dlTarget = current;
+        if (hls && hls.url && current.kind === 'hls' && hls.url !== current.url) {
+          dlTarget = {};
+          for (var dk in current) { if (Object.prototype.hasOwnProperty.call(current, dk)) dlTarget[dk] = current[dk]; }
+          dlTarget.url = hls.url;
+          var qv = hls.variants && hls.variants[hls.variantIndex];
+          if (qv && qv.label) dlTarget.title = current.title + '_' + qv.label;
+        }
+        downloadItem(dlTarget);
+      }
+      else if (a === 'copy' && current) copyText(current.url);
+    });
+
+    progressEl.addEventListener('click', function (e) {
+      if (e.target && e.target.getAttribute('data-a') === 'cancel') {
+        if (progressEl.__cancel) progressEl.__cancel();
+      }
+    });
+
+    var stage = playerEl.querySelector('.stage');
+    var stX = 0, stY = 0, stT = 0, stDrag = false, stTarget = 0, stW = 1, lastTouchAt = 0;
+    var tapTimer = 0, lastTapAt = 0, lastTapX = 0, pressTimer = 0, longPress = false;
+    var stMode = '', stVol = 1, stBri = 1, stH = 1, stWoke = false;
+
+    function previewAt(target) {
+      var el = playerEl.querySelector('.seekpreview');
+      if (!el) return;
+      el.classList.remove('hud', 'left', 'right');
+      var em = el.querySelector('.bar em');
+      if (em) em.style.width = '0';
+      stTarget = target;
+      el.querySelector('b').textContent = fmtTime(target);
+      var d = target - stT;
+      el.querySelector('i').textContent = (d >= 0 ? '+' : '-') + fmtTime(Math.abs(d));
+      el.style.display = 'flex';
+    }
+    function badge(big, small, side, level) {
+      var el = playerEl.querySelector('.seekpreview');
+      if (!el) return;
+      el.classList.remove('hud', 'left', 'right');
+      if (side === 'left' || side === 'right') el.classList.add(side);
+      el.querySelector('b').textContent = big;
+      el.querySelector('i').textContent = small || '';
+      var em = el.querySelector('.bar em');
+      if (level != null) {
+        el.classList.add('hud');
+        if (em) em.style.width = (Math.max(0, Math.min(1, level)) * 100).toFixed(1) + '%';
+      } else if (em) em.style.width = '0';
+      el.style.display = 'flex';
+    }
+    function hidePreview() {
+      var el = playerEl.querySelector('.seekpreview');
+      if (el) el.style.display = 'none';
+    }
+    function stageTap() {
+      if (playerEl.classList.contains('hideui')) { showUI(); return; }
+      if (playerEl.classList.contains('mini') || !playerEl.classList.contains('embed')) {
+        clearTimeout(uiHideTimer);
+        playerEl.classList.add('hideui');
+      } else {
+        showUI();
+      }
+    }
+
+    if (stage) {
+      stage.addEventListener('touchstart', function (e) {
+        if (Date.now() < uiGuardUntil) return;
+        var t0 = e.touches[0];
+        if (!t0) return;
+        stWoke = playerEl.classList.contains('hideui');
+        if (stWoke) showUI();
+        stX = t0.clientX; stY = t0.clientY; stT = curPos(); stDrag = false; stTarget = stT;
+        stW = stage.getBoundingClientRect().width || 1;
+        stH = stage.getBoundingClientRect().height || 1;
+        stMode = '';
+        stVol = videoEl ? (videoEl.muted ? 0 : videoEl.volume) : 1;
+        stBri = brightVal;
+        longPress = false;
+        clearTimeout(pressTimer);
+        if (cfg.gestures) {
+          pressTimer = setTimeout(function () {
+            if (stDrag || longPress || !videoEl || videoEl.paused) return;
+            longPress = true;
+            try { videoEl.playbackRate = 2; } catch (e) {}
+            badge('2x', '倍速中，松手恢复');
+          }, 480);
+        }
+      }, { passive: true });
+
+      stage.addEventListener('touchmove', function (e) {
+        if (Date.now() < uiGuardUntil) return;
+        if (!cfg.gestures) return;
+        var t0 = e.touches[0];
+        if (!t0) return;
+        var dx = t0.clientX - stX;
+        var dy = t0.clientY - stY;
+
+        if (!stMode) {
+          var allowVB = !playerEl.classList.contains('embed');
+          if (Math.abs(dx) > 16 && Math.abs(dx) >= Math.abs(dy)) {
+            stMode = 'seek';
+            clearTimeout(pressTimer);
+            seekUI.pending = false;
+            seekUI.gesture = true;
+            showUI();
+          } else if (allowVB && Math.abs(dy) > 16 && Math.abs(dy) > Math.abs(dx)) {
+            stMode = stX < stW / 2 ? 'bri' : 'vol';
+            clearTimeout(pressTimer);
+          }
+        }
+        if (!stMode) return;
+
+        if (stMode === 'seek') {
+          stDrag = true;
+          var dur = playerDur();
+          if (!dur) { seekUI.gesture = false; return; }
+          var span = Math.min(dur, 180);
+          previewAt(Math.max(0, Math.min(dur, stT + (dx / stW) * span)));
+          paintSeek(stTarget / dur);   // 进度条跟着手势走（分片预取也在里面）
+        } else if (stMode === 'vol') {
+          var v = Math.max(0, Math.min(1, stVol - dy / (stH * 0.7)));
+          try { videoEl.volume = v; videoEl.muted = false; } catch (err) {}
+          badge(Math.round(v * 100) + '%', '音量', 'right', v);
+        } else if (stMode === 'bri') {
+          brightVal = Math.max(0, Math.min(1, stBri - dy / (stH * 0.7)));
+          applyBright();
+          badge(Math.round(brightVal * 100) + '%', '亮度', 'left', brightVal);
+        }
+        e.preventDefault();
+      }, { passive: false });
+
+      stage.addEventListener('touchend', function (e) {
+        clearTimeout(pressTimer);
+        lastTouchAt = Date.now();
+
+        if (longPress) {
+          longPress = false;
+          try { videoEl.playbackRate = SPEEDS[speedIdx]; } catch (e) {}
+          hidePreview();
+          return;
+        }
+        if (stDrag) {
+          stDrag = false;
+          stMode = '';
+          hidePreview();
+          var dur = playerDur();
+          if (dur) commitSeek(Math.max(0, Math.min(1, stTarget / dur)));
+          else { seekUI.gesture = false; syncProgress(); }
+          return;
+        }
+        if (stMode === 'vol' || stMode === 'bri') {
+          stMode = '';
+          hidePreview();
+          return;
+        }
+        stMode = '';
+
+        var t0 = e.changedTouches && e.changedTouches[0];
+        var x = t0 ? t0.clientX : stX;
+        var now = Date.now();
+
+        if (now - lastTapAt < 300 && Math.abs(x - lastTapX) < 70) {
+          clearTimeout(tapTimer);
+          lastTapAt = 0;
+          togglePlay();
+          showUI();
+          return;
+        }
+        lastTapAt = now; lastTapX = x;
+        clearTimeout(tapTimer);
+        if (stWoke) { stWoke = false; return; }
+        tapTimer = setTimeout(function () { stageTap(); }, 260);   // 等一下看是不是双击
+      });
+
+      stage.addEventListener('touchcancel', function () {
+        clearTimeout(pressTimer);
+        if (longPress) {
+          longPress = false;
+          try { videoEl.playbackRate = SPEEDS[speedIdx]; } catch (e) {}
+        }
+        stDrag = false;
+        stMode = '';
+        stWoke = false;
+        hidePreview();
+        if (seekUI.gesture) { seekUI.gesture = false; syncProgress(); showUI(); }
+      });
+
+      stage.addEventListener('click', function () {
+        if (Date.now() < uiGuardUntil) return;
+        if (Date.now() - lastTouchAt < 600) return;
+        stageTap();
+      });
+      stage.addEventListener('dblclick', function () {
+        if (Date.now() < uiGuardUntil) return;
+        if (Date.now() - lastTouchAt < 600) return;
+        togglePlay();
+        showUI();
+      });
+    }
+
+    var seekBar = playerEl.querySelector('.seek');
+
+    function seekRatioAt(x) {
+      var r = seekBar.getBoundingClientRect();
+      return Math.max(0, Math.min(1, (x - r.left) / (r.width || 1)));
+    }
+    function paintSeek(ratio) {
+      ratio = Math.max(0, Math.min(1, ratio));
+      var dur = playerDur();
+      if (dur > 0) seekUI.lastDur = dur;
+      var shownDur = dur || seekUI.lastDur;
+      seekUI.ratio = ratio;
+      seekUI.target = ratio * shownDur;
+      var n = pctlNodes();
+      if (n) {
+        n.bar.style.width = (ratio * 100).toFixed(2) + '%';
+        n.knob.style.left = (ratio * 100).toFixed(2) + '%';
+        n.tm.textContent = fmtTime(seekUI.target) + ' / ' + fmtTime(shownDur);
+        if (n.tip) {
+          n.tip.textContent = fmtTime(seekUI.target);
+          n.tip.style.left = (Math.max(0.06, Math.min(0.94, ratio)) * 100).toFixed(2) + '%';
+        }
+      }
+      if (seekBar) seekBar.classList.toggle('on', !!seekUI.dragging);
+      if (hls && seekUI.target) hls.prefetchAt(seekUI.target);
+    }
+    function commitSeek(ratio) {
+      var dur = playerDur() || seekUI.lastDur;
+      if (!dur) {
+        seekUI.dragging = false; seekUI.gesture = false;
+        seekUI.touchId = null; seekUI.pending = false;
+        syncProgress();
+        return;
+      }
+      forcedEnded = false;
+      if (playerEl) playerEl.classList.remove('ended');
+      var t = Math.max(0, Math.min(dur, ratio * dur));
+      if ((!hls || hls.endlist) && dur > 1 && dur - t < 0.35) t = Math.max(0, dur - 0.35);
+      seekUI.dragging = false;
+      seekUI.gesture = false;
+      seekUI.touchId = null;
+      seekUI.ratio = t / dur;
+      seekUI.target = t;
+      seekUI.pending = true;
+      seekUI.pendingAt = Date.now();
+      seekUI.lastDur = dur;
+      seekUI.hard = !isBuffered(videoEl, t + playerOff());
+      if (seekUI.hard) {
+        if (playerEl) playerEl.classList.add('seeking');
+        showFreeze();
+      } else if (playerEl) playerEl.classList.remove('seeking');
+      paintSeek(seekUI.ratio);
+      var cur = Math.max(0, (videoEl.currentTime || 0) - playerOff());
+      if (Math.abs(cur - t) < 0.2 && !videoEl.seeking) {
+        seekUI.pending = false;                    // 点的就是当前位置，不用真跳
+      } else if (hls && hls.seekTo) {
+        hls.seekTo(t);
+      } else {
+        try { videoEl.currentTime = t; } catch (e) {}
+      }
+      showUI();
+      if (!seekUI.pending) syncProgress();
+    }
+    function seekDragStart(x) {
+      if (seekUI.dragging) return false;
+      if (!playerDur() && !seekUI.lastDur) return false;
+      seekUI.dragging = true;
+      seekUI.pending = false;
+      seekUI.hard = false;
+      forcedEnded = false;
+      if (playerEl) playerEl.classList.remove('ended');
+      seekUI.ratio = seekRatioAt(x);
+      if (playerEl) playerEl.classList.remove('seeking');
+      hideFreeze();
+      showUI();
+      paintSeek(seekUI.ratio);
+      return true;
+    }
+    function seekDragEnd(commit, x) {
+      if (!seekUI.dragging) return;
+      if (x != null) paintSeek(seekRatioAt(x));
+      seekUI.dragging = false;
+      seekUI.touchId = null;
+      if (seekBar) seekBar.classList.remove('on');
+      if (commit) commitSeek(seekUI.ratio);
+      else { seekUI.pending = false; syncProgress(); showUI(); }
+    }
+    function touchById(list, id) {
+      if (!list) return null;
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].identifier === id) return list[i];
+      }
+      return (id == null && list.length) ? list[0] : null;
+    }
+    if (seekBar) {
+      seekBar.addEventListener('touchstart', function (e) {
+        if (e.touches.length > 1) return;
+        var t0 = e.touches[0];
+        if (!t0) return;
+        seekUI.lastTouchAt = Date.now();
+        seekUI.touchId = t0.identifier;
+        if (!seekDragStart(t0.clientX)) return;
+        e.preventDefault();
+        e.stopPropagation();
+      }, { passive: false });
+      seekBar.addEventListener('touchmove', function (e) {
+        if (!seekUI.dragging) return;
+        var t0 = touchById(e.touches, seekUI.touchId);
+        if (!t0) return;
+        paintSeek(seekRatioAt(t0.clientX));
+        e.preventDefault();
+        e.stopPropagation();
+      }, { passive: false });
+      seekBar.addEventListener('touchend', function (e) {
+        if (!seekUI.dragging) return;
+        seekUI.lastTouchAt = Date.now();
+        var t0 = touchById(e.changedTouches, seekUI.touchId);
+        if (!t0) return;                           // 抬的是另一根手指
+        seekDragEnd(true, t0.clientX);
+      });
+      seekBar.addEventListener('touchcancel', function () {
+        if (!seekUI.dragging) return;
+        seekUI.lastTouchAt = Date.now();
+        seekDragEnd(false);                        // 被系统打断：还原，不提交
+      });
+      seekBar.addEventListener('mousedown', function (e) {
+        if (e.button !== 0) return;
+        if (Date.now() - seekUI.lastTouchAt < 700) return;   // 触屏后的合成鼠标事件
+        if (!seekDragStart(e.clientX)) return;
+        e.preventDefault();
+      });
+      window.addEventListener('mousemove', function (e) {
+        if (!seekUI.dragging) return;
+        if (typeof e.buttons === 'number' && (e.buttons & 1) === 0) {
+          seekDragEnd(false);                      // 在窗口外松开了，别卡在拖动态
+          return;
+        }
+        paintSeek(seekRatioAt(e.clientX));
+      });
+      window.addEventListener('mouseup', function (e) {
+        if (!seekUI.dragging) return;
+        seekDragEnd(true, e.clientX);
+      });
+      window.addEventListener('blur', function () {
+        if (seekUI.dragging) seekDragEnd(false);
+      });
+    }
+
+    var evs = ['timeupdate', 'progress', 'durationchange', 'play', 'pause', 'loadedmetadata', 'seeked', 'waiting', 'stalled'];
+    for (var ei = 0; ei < evs.length; ei++) {
+      videoEl.addEventListener(evs[ei], function () { syncProgress(); });
+    }
+
+    function jumpBy(sec) {
+      var dur = playerDur();
+      if (!dur) return;
+      var t = Math.max(0, Math.min(dur, curPos() + sec));
+      commitSeek(dur ? t / dur : 0);
+    }
+    if (navigator.mediaSession) {
+      try {
+        var ms = navigator.mediaSession;
+        ms.setActionHandler('play', function () { userPaused = false; if (videoEl) safePlay(videoEl); });
+        ms.setActionHandler('pause', function () { userPaused = true; try { videoEl.pause(); } catch (e) {} });
+        ms.setActionHandler('seekbackward', function () { jumpBy(-10); });
+        ms.setActionHandler('seekforward', function () { jumpBy(10); });
+        ms.setActionHandler('seekto', function (d) {
+          if (!d || d.seekTime == null) return;
+          var dd = playerDur();
+          if (dd) commitSeek(Math.max(0, Math.min(1, d.seekTime / dd)));
+        });
+      } catch (e) {}
+    }
+
+    var clearBufText = function () {
+      var st = playerEl && playerEl.querySelector('.stat');
+      if (st && st.textContent === '缓冲中…') st.textContent = '';
+    };
+    videoEl.addEventListener('seeked', clearBufText);
+    videoEl.addEventListener('timeupdate', function () {
+      if (!videoEl.paused) clearBufText();
+    });
+
+    videoEl.addEventListener('pause', function () {
+      if (current) savePlayPos(current, curPos());
+      if (playerEl && !(hls && hls.restarting) && !seekUI.pending) playerEl.classList.remove('buffering');
+      if (playerOpen) showUI();
+    });
+    videoEl.addEventListener('timeupdate', function () {
+      if (!current) return;
+      if (Date.now() - lastSaveAt < 6000) return;
+      lastSaveAt = Date.now();
+      savePlayPos(current, curPos());
+    });
+
+    videoEl.addEventListener('play', function () {
+      userPaused = false;
+      forcedEnded = false;
+      try { videoEl.playbackRate = SPEEDS[speedIdx]; } catch (e) {}
+      startSmooth();   // 逐帧刷进度条
+      if (playerOpen) showUI();
+    });
+
+    var onFsChange = function () {
+      if (document.fullscreenElement || document.webkitFullscreenElement) return;
+      if (!playerOpen || !preFullSource) return;
+      var src = preFullSource;
+      preFullSource = null;
+      applyEmbed(src);
+      syncProgress();
+    };
+    document.addEventListener('fullscreenchange', onFsChange);
+    document.addEventListener('webkitfullscreenchange', onFsChange);
+
+    videoEl.addEventListener('volumechange', function () {
+      var mb = playerEl.querySelector('[data-a="mute"]');
+      if (mb) mb.innerHTML = videoEl.muted ? ICON.mute : ICON.vol;
+    });
+
+    videoEl.addEventListener('playing', function () {
+      if (playerEl) {
+        playerEl.classList.remove('loading');
+        playerEl.classList.remove('buffering');
+      }
+      hideFreeze();
+      clearTimeout(loadTimer);
+      var st0 = playerEl && playerEl.querySelector('.stat');
+      if (st0 && st0.textContent === '缓冲中…') st0.textContent = '';
+      if (hls) { hls.retried = false; hls.everPlayed = true; hls.recover = 0; hls.hardRetried = false; }
+      if (!playerOpen || !siteVideo) return;
+      try {
+        siteVideo.pause();
+        siteVideo.style.visibility = 'hidden';
+      } catch (e) {}
+    });
+
+    videoEl.addEventListener('waiting', function () {
+      if (playerOpen && !videoEl.paused && playerEl) playerEl.classList.add('buffering');
+    });
+    videoEl.addEventListener('canplay', function () {
+      if (playerEl && videoEl.readyState >= 3) playerEl.classList.remove('buffering');
+      if (!seekUI.pending) hideFreeze();
+    });
+    videoEl.addEventListener('loadeddata', function () {
+      if (!seekUI.pending) hideFreeze();
+    });
+    videoEl.addEventListener('seeked', function () {
+      if (!seekUI.pending) hideFreeze();
+    });
+
+    videoEl.addEventListener('error', function () {
+      if (!playerOpen) return;
+      var e = videoEl.error;
+      if (!e) return;
+
+      if (hls && (hls.softSeek || hls.restarting || (seekUI.pending && Date.now() - seekUI.pendingAt < 5000))) return;
+
+      if ((e.code === 3 || e.code === 4) && hls) {
+        var at = hls.pendingSeek != null ? hls.pendingSeek : Math.max(0, curPos());
+        if (!hls.transmux && !hls.triedTransmux) {
+          hls.triedTransmux = true;
+          toast('换个解码方式…');
+          hls.forceTransmux(at).catch(function () {
+            toastErr('自动恢复没成功，拖动进度条可重试，或直接下载');
+          });
+          return;
+        }
+        if (hls.everPlayed) {
+          if ((hls.recover || 0) < 3) {
+            hls.recover = (hls.recover || 0) + 1;
+            toast('画面出错，正在恢复…');
+            hls.reloadAt(at).catch(function () {
+              toastErr('自动恢复没成功，拖动进度条可重试，或直接下载');
+            });
+            return;
+          }
+          toast('播放出错，拖一下进度条可以重试');
+          return;
+        }
+        if (!hls.retried) {
+          hls.retried = true;
+          hls.reloadAt(at).catch(function () {
+            toastErr('自动恢复没成功，拖动进度条可重试，或直接下载');
+          });
+          return;
+        }
+      }
+
+      var why = e.code === 4 ? '地址不可用或格式不支持'
+        : e.code === 3 ? '解码失败'
+        : e.code === 2 ? '网络错误'
+        : '播放出错 ' + e.code;
+      if (playerEl) playerEl.classList.remove('loading');
+      var host = '';
+      try { host = new URL((current && current.url) || videoEl.src || '').host; } catch (err) {}
+      var msg = '放不了：' + why + (host ? '（' + host + '）' : '');
+      var t = playerEl.querySelector('.t');
+      if (t) t.textContent = msg;
+      toast(msg + '，稍后返回网页播放');
+      setTimeout(function () { if (playerOpen) closePlayer(); }, 4000);
+    });
+  }
+
+  function ensureFab() {
+    if (!IS_TOP) return;
+    buildUI();
+    if (!fabEl) return;
+    var n = items.size;
+    var show = !playerOpen && !sheetOpen && (n > 0 || hasMse || hasVideoEl);
+    var sig = (show ? '1' : '0') + '|' + n;     // 状态没变就别碰样式，省掉每轮的样式重算
+    if (sig === fabState) return;
+    fabState = sig;
+    var dot = fabEl.querySelector('.dot');
+    if (dot) dot.textContent = n > 99 ? '99+' : String(n);
+    fabEl.classList.toggle('has', n > 0);
+    fabEl.style.display = show ? 'flex' : 'none';
+    if (show) {
+      helloOnce();
+      if (n > 0) showFabTip();
+    }
+  }
+
+  var fabTipped = false;
+  function showFabTip() {
+    if (!fabEl || fabTipped) return;
+    fabTipped = true;
+    try { if (localStorage.getItem('xbvk.tipped') === '1') return; } catch (e) {}
+
+    var tip = fabEl.querySelector('.tip');
+    if (tip) {
+      var r = fabEl.getBoundingClientRect();
+      if (r.top < 80) tip.className = 'tip b';   // 球贴近顶部时气泡改到下方
+    }
+    fabEl.classList.add('tipon');
+    setTimeout(function () { if (fabEl) fabEl.classList.remove('tipon'); }, 9000);
+  }
+
+  function helloOnce() {
+    var prev = null;
+    try {
+      prev = localStorage.getItem('xbvk.hello');
+      localStorage.setItem('xbvk.hello', VERSION);
+    } catch (e) { return; }
+    setTimeout(function () {
+      try {
+        if (prev === null) {
+          alert('视频提取 v' + VERSION + ' 已启动\n\n' +
+            '· 网页开始播放时，自动用内置播放器接管那块画面\n' +
+            '· 右下角「视频」按钮：点一下全屏播放，长按看列表\n\n' +
+            '看到这个弹窗，说明脚本运行正常。');
+        } else if (prev !== VERSION) {
+          toast('视频提取已更新到 v' + VERSION);
+        }
+      } catch (e) {}
+    }, 1500);
+  }
+
+  var visWarned = false;
+  function ensureVisible(el, tag) {
+    setTimeout(function () {
+      if (visWarned || !el) return;
+      var r = null, disp = '';
+      try { r = el.getBoundingClientRect(); disp = getComputedStyle(el).display; } catch (e) {}
+      if (!r) return;
+      var ok = r.height > 40 && r.width > 40 && r.bottom > 20 && r.top < (window.innerHeight - 20) && disp !== 'none';
+      if (ok) return;
+      visWarned = true;
+      try {
+        alert('界面没有正常显示（' + tag + '）\n\n' +
+          '尺寸 ' + Math.round(r.width) + '×' + Math.round(r.height) +
+          '，位置 ' + Math.round(r.left) + ',' + Math.round(r.top) +
+          '，display ' + disp +
+          '\n视口 ' + window.innerWidth + '×' + window.innerHeight +
+          '\n\n把这张截图发给我。');
+      } catch (e) {}
+    }, 700);
+  }
+
+  function openSheet() {
+    buildUI();
+    if (!sheetEl) return;
+    if (fabEl) {
+      fabEl.classList.remove('tipon');
+      try { localStorage.setItem('xbvk.tipped', '1'); } catch (e) {}
+    }
+    scanDom();
+    sheetOpen = true;
+    uiGuardUntil = Date.now() + 450;   // 吃掉 touchend 之后补发的那次 click
+    listFresh = true;                  // 首次打开：卡片交错入场（面板开着时的刷新不重播）
+    renderList();
+    renderDownloads();                 // 下载页签角标/列表（含初始化后的清单）
+    sheetEl.classList.add('open');
+    ui.mask.classList.add('on');
+    ensureFab();
+    ensureVisible(sheetEl, '面板');
+  }
+
+  function renderSettings() {
+    if (!setEl) return;
+    var sws = setEl.querySelectorAll('.sw');
+    for (var i = 0; i < sws.length; i++) {
+      sws[i].classList.toggle('on', !!cfg[sws[i].getAttribute('data-k')]);
+    }
+    var segs = setEl.querySelectorAll('.seg');
+    for (var j = 0; j < segs.length; j++) {
+      var k = segs[j].getAttribute('data-k');
+      var bs = segs[j].querySelectorAll('button');
+      for (var n = 0; n < bs.length; n++) {
+        bs[n].classList.toggle('on', Number(bs[n].getAttribute('data-v')) === Number(cfg[k]));
+      }
+    }
+    var csz = setEl.querySelector('.csz');
+    if (csz) csz.textContent = (segCacheBytes / 1048576).toFixed(1) + ' MB';
+  }
+
+  function applyCfg() {
+    var idx = SPEEDS.indexOf(Number(cfg.speed));
+    if (idx >= 0) speedIdx = idx;
+    if (playerOpen && videoEl && !videoEl.paused) {
+      try { videoEl.playbackRate = SPEEDS[speedIdx]; } catch (e) {}
+    }
+    var spb = playerEl && playerEl.querySelector('[data-a="speed"]');
+    if (spb) spb.textContent = fmtSpeed(SPEEDS[speedIdx]);
+  }
+
+  function openSettings() {
+    buildUI();
+    if (!setEl) return;
+    settingsOpen = true;
+    renderSettings();
+    setEl.classList.add('open');
+    ui.mask.classList.add('on');
+    uiGuardUntil = Date.now() + 320;
+  }
+
+  function closeSettings() {
+    if (!setEl) return;
+    settingsOpen = false;
+    setEl.classList.remove('open');
+    if (!sheetOpen) ui.mask.classList.remove('on');
+  }
+
+  function closeSheet() {
+    if (!sheetEl) return;
+    if (settingsOpen) closeSettings();
+    sheetOpen = false;
+    sheetEl.classList.remove('open');
+    ui.mask.classList.remove('on');
+    if (playerHiddenForSheet && playerOpen) {
+      playerHiddenForSheet = false;
+      playerEl.classList.add('open');
+      syncProgress();
+    }
+    ensureFab();
+  }
+
+  var renderPending = false;
+  var listFresh = false;   // 列表卡片是否交错入场（只在面板刚打开时）
+  function scheduleRender() {
+    if (!sheetOpen || renderPending) return;
+    renderPending = true;
+    var run = function () {
+      renderPending = false;
+      if (sheetOpen) renderList();
+    };
+    try { window.requestAnimationFrame(run); } catch (e) { setTimeout(run, 16); }
+  }
+
+  function renderList() {
+    if (!listEl) return;
+    listDirty = false;
+    var arr = sortedItems();
+    var cnt = sheetEl.querySelector('.cnt');
+    if (cnt) cnt.textContent = arr.length ? arr.length + ' 个' : '';
+
+    if (!arr.length) {
+      listEl.innerHTML = '';
+      var d = document.createElement('div');
+      d.className = 'empty';
+      var msg;
+      if (hasVideoEl) msg = '<b>页面里有视频，但还没拿到地址</b><br>先在页面里点一下播放，再回来看看';
+      else if (hasMse) msg = '<b>这是 MSE 流，抓不到直链</b><br>可以用下面的「录制当前画面」';
+      else msg = '<b>这个页面暂时没有视频</b><br>换个页面，或者点下面重新扫一次';
+      d.innerHTML =
+        '<svg viewBox="0 0 24 24" width="36" height="36" fill="none" stroke="#565e6b" stroke-width="1.5">' +
+        '<rect x="2.6" y="4.6" width="18.8" height="14.8" rx="3.2"/>' +
+        '<path d="M10.2 9.3l5 2.7-5 2.7z" fill="#565e6b" stroke="none"/></svg>' +
+        msg + '<br><button data-a="rescan" class="mini">重新扫描</button>';
+      listEl.appendChild(d);
+      return;
+    }
+
+    listEl.innerHTML = '';
+    for (var i = 0; i < arr.length; i++) {
+      var row = renderItem(arr[i]);
+      if (listFresh) row.style.animation = 'xbit .22s ease-out ' + Math.min(i, 8) * 30 + 'ms backwards';
+      listEl.appendChild(row);
+    }
+    listFresh = false;
+  }
+
+  function renderItem(it) {
+    var row = document.createElement('div');
+    row.className = 'it';
+    row.setAttribute('data-id', String(it.id));
+
+    var label = it.kind === 'hls' ? 'HLS' : it.kind === 'dash' ? 'DASH'
+      : it.kind === 'blob' ? 'BLOB' : it.kind === 'flv' ? 'FLV'
+      : it.kind === 'ts' ? 'TS' : it.kind === 'webm' ? 'WEBM' : 'MP4';
+
+    var r1 = document.createElement('div');
+    r1.className = 'r1';
+    var b = document.createElement('span');
+    b.className = 'badge' + (it.kind === 'hls' ? ' hls' : '');
+    b.textContent = label;
+    var nm = document.createElement('span');
+    nm.className = 'nm';
+    nm.textContent = it.title;
+    r1.appendChild(b);
+    r1.appendChild(nm);
+    if (it.size) {
+      var sz = document.createElement('span');
+      sz.className = 'sz';
+      sz.textContent = fmtBytes(it.size);
+      r1.appendChild(sz);
+    }
+    row.appendChild(r1);
+
+    var u = document.createElement('div');
+    u.className = 'u';
+    u.textContent = it.url;
+    row.appendChild(u);
+
+    var acts = document.createElement('div');
+    acts.className = 'acts';
+
+    var playable = (it.kind !== 'dash');
+    var pb = document.createElement('button');
+    pb.className = playable ? 'pri' : '';
+    pb.setAttribute('data-act', 'play');
+    pb.textContent = playable ? '播放' : '不支持';
+    if (!playable) pb.disabled = true;
+    acts.appendChild(pb);
+
+    var db = document.createElement('button');
+    db.setAttribute('data-act', 'dl');
+    db.textContent = '下载';
+    acts.appendChild(db);
+
+    var cb = document.createElement('button');
+    cb.setAttribute('data-act', 'copy');
+    cb.textContent = '复制';
+    acts.appendChild(cb);
+
+    row.appendChild(acts);
+    return row;
+  }
+
+  /* ---------------- 下载管理页签 ---------------- */
+  var dlTabOpen = false;
+
+  function dlKindOf(name, mime) {
+    var m = ((/\.([a-z0-9]{1,5})$/i.exec(name || '') || [])[1] || '').toLowerCase();
+    if (['mp4', 'm4v', 'webm', 'mov', 'ts', 'mkv', 'flv', 'mpg', 'mpeg', '3gp', 'avi'].indexOf(m) >= 0) return 'video';
+    if (['txt', 'log', 'md', 'srt', 'ass', 'vtt', 'json', 'xml', 'html', 'htm', 'csv', 'nfo'].indexOf(m) >= 0 || /^text\//i.test(mime || '')) return 'txt';
+    if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg'].indexOf(m) >= 0 || /^image\//i.test(mime || '')) return 'img';
+    return 'file';
+  }
+
+  function dlPlayable(name) {
+    var m = ((/\.([a-z0-9]{1,5})$/i.exec(name || '') || [])[1] || '').toLowerCase();
+    return ['mp4', 'm4v', 'webm', 'mov', 'ts'].indexOf(m) >= 0;
+  }
+
+  var DL_ICONS = {
+    video: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#7fa9ff" stroke-width="1.8"><rect x="2.6" y="4.6" width="18.8" height="14.8" rx="3.2"/><path d="M10.2 9.3l5 2.7-5 2.7z" fill="#7fa9ff" stroke="none"/></svg>',
+    txt: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#3ecd96" stroke-width="1.8"><path d="M6 2.8h8l4 4v14.4H6z"/><path d="M14 2.8v4h4M9 12h6M9 15.5h6"/></svg>',
+    img: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#ffb545" stroke-width="1.8"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><circle cx="8.6" cy="10" r="1.6"/><path d="M4.5 17.5l5-5 3.4 3.4 3-2.6 4.5 4.2"/></svg>',
+    file: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#8b93a1" stroke-width="1.8"><path d="M6 2.8h8l4 4v14.4H6z"/><path d="M14 2.8v4h4"/></svg>'
+  };
+
+  function fmtDate(ts) {
+    var d = new Date(ts);
+    function p(x) { return (x < 10 ? '0' : '') + x; }
+    return (d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+
+  function dlManBytes() {
+    var s = 0;
+    dlMan.files.forEach(function (f) { s += f.size || 0; });
+    return s;
+  }
+
+  function renderDownloads() {
+    if (!dlistEl) return;
+    var n = dlMan.files.length;
+    var dnum = sheetEl.querySelector('.dnum');
+    if (dnum) {
+      dnum.textContent = n > 99 ? '99+' : String(n);
+      dnum.classList.toggle('on', n > 0);
+    }
+    if (!dlTabOpen) return;
+
+    dlistEl.innerHTML = '';
+
+    var use = document.createElement('div');
+    use.className = 'dluse';
+    use.innerHTML = '<b>' + (dlDir ? '本站已用 ' + fmtBytes(dlManBytes()) : '内存暂存，退出页面即失效') +
+      '</b><span class="sp"></span>' + (n ? '<button data-act="clearall">清空</button>' : '');
+    dlistEl.appendChild(use);
+    if (dlDir && navigator.storage && navigator.storage.estimate) {
+      navigator.storage.estimate().then(function (es) {
+        var b = use.querySelector('b');
+        if (b && es) b.textContent = '本站已用 ' + fmtBytes(es.usage || 0) + (es.quota ? ' / 配额约 ' + fmtBytes(es.quota) : '');
+      }).catch(function () {});
+    }
+
+    if (dlActive > 0) {
+      var run = document.createElement('div');
+      run.className = 'dlrun';
+      run.innerHTML = '<b>⬇</b>有下载任务进行中，进度见悬浮进度卡';
+      dlistEl.appendChild(run);
+    }
+
+    // 未完成任务（断点续传）
+    for (var ti = 0; ti < dlTasks.length; ti++) dlistEl.appendChild(taskRow(dlTasks[ti]));
+
+    if (!n && !dlTasks.length) {
+      var d = document.createElement('div');
+      d.className = 'empty';
+      d.innerHTML = '<svg viewBox="0 0 24 24" width="36" height="36" fill="none" stroke="#565e6b" stroke-width="1.5">' +
+        '<path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2.6A1.4 1.4 0 0 0 5.4 21h13.2a1.4 1.4 0 0 0 1.4-1.4V17"/></svg>' +
+        '<b>还没有下载的文件</b><br>在「视频」页签点下载，存完在这里打开 / 导出';
+      dlistEl.appendChild(d);
+      return;
+    }
+    if (!n) return;
+
+    for (var i = 0; i < n; i++) dlistEl.appendChild(dlRow(dlMan.files[i]));
+  }
+
+  function taskRow(tk) {
+    var prog;
+    if (tk.kind === 'hls') {
+      var had = 0;
+      for (var i = 0; i < (tk.done || []).length; i++) { if (tk.done[i]) had++; }
+      prog = '未完成 · 已下 ' + had + '/' + (tk.segs ? tk.segs.length : '?') + ' 段';
+    } else {
+      prog = '未完成 · 已下 ' + fmtBytes(tk.received || 0) + (tk.total ? ' / ' + fmtBytes(tk.total) : '');
+    }
+    var row = document.createElement('div');
+    row.className = 'dit dtask';
+    row.setAttribute('data-tid', tk.id);
+    row.innerHTML =
+      '<div class="r1"><div class="ic">⏸</div><div class="nm"><b></b><i></i></div></div>' +
+      '<div class="acts"><button data-act="go" class="pri">继续</button><button data-act="tdel">删除</button></div>';
+    var nb = row.querySelector('.nm b');
+    if (nb) nb.textContent = tk.name;
+    var ni = row.querySelector('.nm i');
+    if (ni) ni.textContent = prog;
+    return row;
+  }
+
+  function dlRow(f) {
+    var kind = dlKindOf(f.name, f.mime);
+    var row = document.createElement('div');
+    row.className = 'dit';
+    row.setAttribute('data-id', f.id);
+
+    var r1 = document.createElement('div');
+    r1.className = 'r1';
+    var ic = document.createElement('div');
+    ic.className = 'ic' + (kind === 'txt' ? ' txt' : kind === 'img' ? ' img' : '');
+    ic.innerHTML = DL_ICONS[kind] || DL_ICONS.file;
+    var nm = document.createElement('div');
+    nm.className = 'nm';
+    var nb = document.createElement('b');
+    nb.textContent = f.name;
+    var ni = document.createElement('i');
+    ni.textContent = fmtBytes(f.size) + ' · ' + fmtDate(f.ts);
+    nm.appendChild(nb);
+    nm.appendChild(ni);
+    r1.appendChild(ic);
+    r1.appendChild(nm);
+    row.appendChild(r1);
+
+    var acts = document.createElement('div');
+    acts.className = 'acts';
+    function btn(act, label, pri) {
+      var b = document.createElement('button');
+      b.setAttribute('data-act', act);
+      b.textContent = label;
+      if (pri) b.className = 'pri';
+      acts.appendChild(b);
+    }
+    if (kind === 'video' && dlPlayable(f.name)) btn('play', '播放', true);
+    else if (kind === 'txt' || kind === 'img') btn('view', '查看', true);
+    btn('share', '保存 / 分享');
+    btn('del', '删除');
+    row.appendChild(acts);
+    return row;
+  }
+
+  /* ---------------- 下载文件打开：内置播放器 / txt / 图片 ---------------- */
+  var dlObjUrls = [];
+  var viewerFile = null, viewerBlob = null;
+
+  function playDlFile(f, blob) {
+    var ext = ((/\.[a-z0-9]{1,5}$/i.exec(f.name) || [''])[0]).toLowerCase();
+    if (ext === '.ts') {
+      openPlayer(f.name, null);
+      playTsBuffer(blob);
+      return;
+    }
+    var objUrl = URL.createObjectURL(blob);
+    dlObjUrls.push(objUrl);
+    playItem({
+      id: 'dl' + f.id,
+      url: objUrl,
+      kind: ext === '.webm' ? 'webm' : 'mp4',
+      title: f.name,
+      size: f.size,
+      score: 100,
+      pkey: 'xbvk.p:dl:' + f.id   // blob URL 每次都不同，进度记忆挂固定 id
+    });
+  }
+
+  function viewText(f, blob) {
+    buildUI();
+    if (!tvEl) return;
+    viewerFile = f; viewerBlob = blob;
+    tvEl.querySelector('.vt').textContent = f.name;
+    var pre = tvEl.querySelector('.vbody');
+    pre.textContent = '读取中…';
+    tvEl.classList.add('open');
+    if (!blob.arrayBuffer) { pre.textContent = '内核不支持读取文本'; return; }
+    blob.arrayBuffer().then(function (ab) {
+      function tryDec(label) {
+        try { return new TextDecoder(label, { fatal: true }); } catch (e) { return null; }
+      }
+      var text = null;
+      var d1 = tryDec('utf-8');
+      if (d1) { try { text = d1.decode(ab); } catch (e) {} }
+      if (text == null) {
+        var d2 = tryDec('gb18030');
+        if (d2) { try { text = d2.decode(ab); } catch (e) {} }
+      }
+      if (text == null) text = new TextDecoder().decode(ab);
+      pre.textContent = text.length > 2 * 1024 * 1024 ? text.slice(0, 2 * 1024 * 1024) + '\n…（太大，仅显示前 2MB）' : text;
+    }).catch(function () { pre.textContent = '读取失败'; });
+  }
+
+  function viewImage(f, blob) {
+    buildUI();
+    if (!ivEl) return;
+    viewerFile = f; viewerBlob = blob;
+    ivEl.querySelector('.vt').textContent = f.name;
+    var img = ivEl.querySelector('img');
+    var old = img.getAttribute('src');
+    if (old) { try { URL.revokeObjectURL(old); } catch (e) {} }
+    img.src = URL.createObjectURL(blob);
+    ivEl.classList.add('open');
+  }
+
+  function closeViewer() {
+    if (tvEl) tvEl.classList.remove('open');
+    if (ivEl) {
+      var img = ivEl.querySelector('img');
+      var old = img && img.getAttribute('src');
+      if (old) { try { URL.revokeObjectURL(old); } catch (e) {} }
+      if (img) img.removeAttribute('src');
+      ivEl.classList.remove('open');
+    }
+    viewerFile = null;
+    viewerBlob = null;
+  }
+
+  var toastTimer = null;
+  function toast(msg) {
+    buildUI();
+    if (!toastEl) return;
+    toastEl.textContent = msg;
+    toastEl.classList.add('on');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toastEl.classList.remove('on'); }, 2600);
+  }
+
+  var lastErrMsg = '', lastErrAt = 0;
+  function toastErr(msg) {
+    var now = Date.now();
+    if (msg === lastErrMsg && now - lastErrAt < 3000) return;
+    lastErrMsg = msg;
+    lastErrAt = now;
+    toast(msg);
+  }
+
+  function showProgress(title) {
+    buildUI();
+    progressEl.classList.add('on');
+    var txt = progressEl.querySelector('.txt');
+    var fill = progressEl.querySelector('.fill');
+    var sub = progressEl.querySelector('.sub');
+    txt.textContent = title;
+    fill.style.width = '0%';
+    sub.textContent = '';
+    var obj = {
+      cancelled: false,
+      onCancel: null,
+      set: function (t) { txt.textContent = t; },
+      sub: function (s) { sub.textContent = s || ''; },
+      progress: function (cur, total) {
+        var p = total ? Math.min(100, cur / total * 100) : 0;
+        fill.style.width = p.toFixed(1) + '%';
+        txt.textContent = title + '  ' + cur + '/' + total;
+      },
+      close: function () {
+        progressEl.classList.remove('on');
+        progressEl.__cancel = null;
+        sub.textContent = '';
+      }
+    };
+    progressEl.__cancel = function () {
+      obj.cancelled = true;
+      txt.textContent = '正在取消…';
+      if (typeof obj.onCancel === 'function') { try { obj.onCancel(); } catch (e) {} }
+    };
+    return obj;
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  播放器
+   * ------------------------------------------------------------------ */
+  function embedRect(r) {
+    var vw = window.innerWidth || 0, vh = window.innerHeight || 0;
+    var L = Math.max(0, Math.min(r.left, Math.max(0, vw - 120)));
+    var T = Math.max(0, Math.min(r.top, Math.max(0, vh - 120)));
+    return {
+      left: L,
+      top: T,
+      width: Math.max(120, Math.min(r.width, vw - L)),
+      height: Math.max(90, Math.min(r.height, vh - T))
+    };
+  }
+
+  function applyEmbed(src) {
+    if (!src) return false;
+    var r;
+    try { r = src.getBoundingClientRect ? src.getBoundingClientRect() : src; } catch (e) { return false; }
+    if (!r || r.width < 40 || r.height < 30) return false;
+    var er = embedRect(r);
+    playerEl.classList.add('embed');
+    playerEl.classList.toggle('mini', er.width < 340 || er.height < 200);
+    playerEl.style.left = er.left + 'px';
+    playerEl.style.top = er.top + 'px';
+    playerEl.style.width = er.width + 'px';
+    playerEl.style.height = er.height + 'px';
+    playerEl.style.right = 'auto';
+    playerEl.style.bottom = 'auto';
+    embedTarget = src.getBoundingClientRect ? src : null;
+    window.removeEventListener('scroll', syncEmbed, true);
+    window.removeEventListener('resize', syncEmbed);
+    window.addEventListener('scroll', syncEmbed, { passive: true, capture: true });
+    window.addEventListener('resize', syncEmbed);
+    return true;
+  }
+
+  function openPlayer(title, rect) {
+    buildUI();
+    playerOpen = true;
+    resetSeekUI();
+    closeMenus(true);
+    userPaused = false;
+    forcedEnded = false;
+    playerEl.classList.remove('ended');
+    var spb0 = playerEl.querySelector('[data-a="speed"]');
+    if (spb0) spb0.textContent = fmtSpeed(SPEEDS[speedIdx]);
+    playerHiddenForSheet = false;
+    playerEl.classList.add('loading');
+    clearTimeout(loadTimer);
+    loadTimer = setTimeout(function () {
+      if (playerEl && playerEl.classList.contains('loading')) {
+        playerEl.classList.remove('loading');
+        playerEl.classList.add('buffering');
+      }
+    }, 12000);
+    uiGuardUntil = Date.now() + 450;
+    playerEl.classList.add('open');
+    playerEl.querySelector('.t').textContent = title || '';
+    var qb = playerEl.querySelector('[data-a="q"]');
+    if (qb) qb.style.display = 'none';
+
+    if (rect && rect.width > 40 && rect.height > 30) {
+      if (applyEmbed(rect.source || rect) && rect.source) {
+        try { rect.source.pause(); } catch (e) {}   // 别两个声音一起响
+      }
+    } else {
+      playerEl.classList.remove('embed');
+      playerEl.classList.remove('mini');
+      playerEl.style.cssText = '';
+      embedTarget = null;
+    }
+
+    if (sheetEl) {
+      sheetOpen = false;
+      sheetEl.classList.remove('open');
+      ui.mask.classList.remove('on');
+    }
+    ensureFab();
+    ensureVisible(playerEl, '播放器');
+    syncProgress();
+    showUI();
+  }
+
+  var embedTarget = null;
+  function syncEmbed() {
+    if (!playerOpen || !embedTarget || !embedTarget.getBoundingClientRect) return;
+    try {
+      var r = embedTarget.getBoundingClientRect();
+      if (r.width < 40 || r.height < 30) return;
+      var er = embedRect(r);
+      playerEl.classList.toggle('mini', er.width < 340 || er.height < 200);
+      playerEl.style.left = er.left + 'px';
+      playerEl.style.top = er.top + 'px';
+      playerEl.style.width = er.width + 'px';
+      playerEl.style.height = er.height + 'px';
+    } catch (e) {}
+  }
+
+  function closePlayer() {
+    if (current) savePlayPos(current, curPos());
+    resetSeekUI();
+    closeMenus(true);
+    userPaused = false;
+    forcedEnded = false;
+    if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
+    stopSmooth();
+    try {
+      videoEl.pause();
+      videoEl.removeAttribute('src');
+      videoEl.load();
+    } catch (e) {}
+    exitFull();
+    preFullSource = null;
+    clearTimeout(uiHideTimer);
+    clearTimeout(loadTimer);
+    playerEl.classList.remove('hideui');
+    playerEl.classList.remove('paused');
+    playerEl.classList.remove('ended');
+    playerEl.classList.remove('loading');
+    playerEl.classList.remove('seeking');
+    playerEl.classList.remove('buffering');
+    hideFreeze();
+    playerEl.classList.remove('open');
+    playerEl.classList.remove('embed');
+    playerEl.classList.remove('mini');
+    playerEl.style.cssText = '';
+    embedTarget = null;
+    try {
+      window.removeEventListener('scroll', syncEmbed, true);
+      window.removeEventListener('resize', syncEmbed);
+    } catch (e) {}
+    restoreSiteVideo();
+    for (var ri = 0; ri < dlObjUrls.length; ri++) { try { URL.revokeObjectURL(dlObjUrls[ri]); } catch (e) {} }
+    dlObjUrls.length = 0;
+    playerOpen = false;
+    current = null;
+    ensureFab();
+  }
+
+  function safePlay(v) {
+    if (!v) return;
+    var p;
+    try { p = v.play(); } catch (e) { return; }
+    if (!p || !p.catch) return;
+    p.catch(function (e) {
+      if (e && e.name === 'NotAllowedError') {
+        try {
+          v.muted = true;
+          var p2 = v.play();
+          if (p2 && p2.catch) p2.catch(function () {
+            toast('自动播放被拦，点一下画面开始');
+          });
+          toast('内核限制了自动播放，已静音播放（可点音量开启声音）');
+        } catch (err) {}
+      }
+    });
+  }
+
+  function updateQualityBtn(inst) {
+    var btn = playerEl && playerEl.querySelector('[data-a="q"]');
+    if (!btn) return;
+    var vs = (inst && inst.variants) || [];
+    if (vs.length < 2) { btn.style.display = 'none'; return; }
+    btn.style.display = '';
+    var v = vs[inst.variantIndex || 0];
+    btn.textContent = (v && v.label) || '清晰度';
+  }
+
+  function quickPlay() {
+    var arr = sortedItems();
+    var pick = null;
+    for (var i = 0; i < arr.length; i++) {
+      if (arr[i].kind === 'dash') continue;    // DASH 内置放不了，跳过
+      pick = arr[i];
+      break;
+    }
+    if (!pick) { openSheet(); return; }        // 没有可播的，退回列表说明原因
+    playItem(pick);
+  }
+
+  function tryTakeover(v) {
+    if (takeoverTried || playerOpen || !IS_TOP) return;
+    if (!v || v === videoEl || v.tagName !== 'VIDEO') return;
+    if (v.videoWidth && v.videoWidth < 200) return;        // 小窗/贴片广告不接管
+
+    var r;
+    try { r = v.getBoundingClientRect(); } catch (e) { return; }
+    if (!r || r.width < 160 || r.height < 90) return;      // 太小的播放框不动
+
+    var it = pickPlayable(v);
+    if (!it) return;                                       // 没得换，就让网页自己播
+
+    takeoverTried = true;
+    siteVideo = v;
+    try { siteWasPlaying = !v.paused; v.pause(); } catch (e) {}
+    playItem(it, { left: r.left, top: r.top, width: r.width, height: r.height, source: v });
+  }
+
+  function pickPlayable(v) {
+    var url = (v && (v.currentSrc || v.src)) || '';
+    if (url && /^https?:/i.test(url)) {
+      var hit = items.get(absolutize(url));
+      if (hit) return hit;
+    }
+    var arr = sortedItems();
+    for (var i = 0; i < arr.length; i++) {
+      if (arr[i].kind === 'hls' && arr[i].score >= 50) return arr[i];
+    }
+    return null;
+  }
+
+  var autoTakeoverTimer = 0;
+  function scheduleAutoTakeover() {
+    if (!cfg.autoTakeover) return;
+    if (takeoverTried || playerOpen || !IS_TOP || autoTakeoverTimer) return;
+    autoTakeoverTimer = setTimeout(function () {
+      autoTakeoverTimer = 0;
+      autoTakeoverNow();
+    }, 900);
+  }
+
+  function autoTakeoverNow() {
+    if (takeoverTried || playerOpen || !IS_TOP) return;
+
+    var vids = collectVideos(document);
+    var best = null, bestArea = 0, bestRect = null;
+    for (var i = 0; i < vids.length; i++) {
+      var v = vids[i];
+      if (v === videoEl) continue;
+      var r;
+      try { r = v.getBoundingClientRect(); } catch (e) { continue; }
+      if (!r || r.width < 260 || r.height < 140) continue;              // 小窗不动
+      if (r.bottom < 60 || r.top > window.innerHeight - 60) continue;    // 必须在可视区
+      var area = r.width * r.height;
+      if (area > bestArea) { bestArea = area; best = v; bestRect = r; }
+    }
+    if (!best) return;
+
+    var it = pickPlayable(best);
+    if (!it) return;
+
+    takeoverTried = true;
+    siteVideo = best;
+    try { siteWasPlaying = !best.paused; best.pause(); } catch (e) {}
+    playItem(it, {
+      left: bestRect.left, top: bestRect.top,
+      width: bestRect.width, height: bestRect.height, source: best
+    });
+  }
+
+  function restoreSiteVideo() {
+    if (!siteVideo) return;
+    try { siteVideo.style.visibility = ''; } catch (e) {}
+    if (siteWasPlaying) {
+      try { var p = siteVideo.play(); if (p && p.catch) p.catch(function () {}); } catch (e) {}
+    }
+    siteWasPlaying = false;
+    siteVideo = null;
+  }
+
+  function playItem(it, rect) {
+    if (!it) return;
+    current = it;
+    setMediaMeta(it);
+    if (it.kind === 'dash') { toast('DASH 流暂不支持直接播放，已复制地址'); copyText(it.url); return; }
+
+    openPlayer(it.title, rect);
+
+    if (it.kind === 'hls') {
+      videoEl.removeAttribute('src');
+      var stat = playerEl.querySelector('.stat');
+      stat.textContent = '解析播放列表…';
+      var inst = new HlsPlayer(it.url, videoEl, function (s) {
+        if (s && s.total) stat.textContent = s.buffered + '/' + s.total + ' 段';
+        else if (s && s.msg) {
+          stat.textContent = s.msg;
+          if (s.err) toastErr(s.msg);
+        }
+      });
+      hls = inst;
+      var resume = cfg.resume ? loadPlayPos(it) : 0;
+      inst.start(resume, Number(cfg.skipIntro) || 0).then(function () {
+        stat.textContent = '';
+        updateQualityBtn(inst);
+        if (inst.startedAt > 0 && inst.startedAt === resume) {
+          setTimeout(function () { toast('从上次的 ' + fmtTime(resume) + ' 继续'); }, 1200);
+        }
+      }, function (err) {
+        stat.textContent = '';
+        try { inst.destroy(); } catch (e) {}
+        if (hls === inst) hls = null;
+        try { videoEl.removeAttribute('src'); videoEl.load(); } catch (e) {}
+        var why = (err && err.message) ? err.message : '未知错误';
+        var t = playerEl.querySelector('.t');
+        if (t) t.textContent = '放不了：' + why;
+        toast('内置播放器放不了：' + why);
+        setTimeout(function () { if (playerOpen) closePlayer(); }, 4000);
+      });
+      return;
+    }
+
+    if (it.kind === 'ts') { playTs(it.url); return; }
+
+    if (it.kind === 'flv') {
+      toast('浏览器不支持 FLV 直接播放，请先下载');
+    }
+
+    videoEl.src = it.url;
+    var resume2 = cfg.resume ? loadPlayPos(it) : 0;
+    var startAt = resume2 > 5 ? resume2 : (Number(cfg.skipIntro) || 0);
+    if (startAt > 0) {
+      var once = function () {
+        videoEl.removeEventListener('loadedmetadata', once);
+        try {
+          var d = videoEl.duration;
+          if (resume2 > 5 && isFinite(d) && d > 0 && resume2 > d - 15) return;   // 已经看到结尾了，从头来
+          videoEl.currentTime = startAt;
+          if (resume2 > 5) setTimeout(function () { toast('从上次的 ' + fmtTime(resume2) + ' 继续'); }, 1200);
+        } catch (e) {}
+      };
+      videoEl.addEventListener('loadedmetadata', once);
+    }
+    safePlay(videoEl);
+  }
+
+  function playTs(url) {
+    fetchBuf(url).then(function (buf) {
+      playTsBuffer(buf);
+    }, function () {
+      toast('TS 加载失败，可先下载');
+    });
+  }
+
+  function playTsBuffer(buf) {
+    var mime = pickMime(false);
+    if (!mime) { toast('内核不支持 TS 播放，请先下载'); return; }
+    var ms = new MediaSource();
+    var objUrl = URL.createObjectURL(ms);
+    dlObjUrls.push(objUrl);
+    videoEl.src = objUrl;
+    ms.addEventListener('sourceopen', function () {
+      var sb;
+      try { sb = ms.addSourceBuffer(mime); } catch (e) { toast('TS 播放失败'); return; }
+      appendTo(sb, buf).then(function () {
+        try { ms.endOfStream(); } catch (e) {}
+        safePlay(videoEl);
+      }).catch(function () {
+        toast('TS 播放失败');
+      });
+    }, { once: true });
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  HLS 引擎（MSE，自包含，不依赖外部库）
+   * ------------------------------------------------------------------ */
+  function parseAttrs(s) {
+    var out = {};
+    var re = /([A-Za-z0-9-]+)=("[^"]*"|[^,]*)/g;
+    var m;
+    while ((m = re.exec(s))) {
+      out[m[1].toUpperCase()] = m[2].replace(/^"|"$/g, '');
+    }
+    return out;
+  }
+
+  function xfetch(url, asText, opt) {
+    opt = opt || {};
+    function once(cred) {
+      var init = { credentials: cred };
+      if (opt.signal) init.signal = opt.signal;
+      if (opt.range) init.headers = { Range: 'bytes=' + opt.range };
+      return netFetch(url, init).then(function (r) {
+        if (!r.ok && r.status !== 206) throw new Error('HTTP ' + r.status);
+        return asText ? r.text() : r.arrayBuffer();
+      });
+    }
+    return once('same-origin').catch(function (e) {
+      if (e && e.name === 'AbortError') throw e;
+      if (e && /^HTTP /.test(e.message)) throw e;   // 服务端明确报错，不必重试
+      return once('include');
+    });
+  }
+
+  function fetchText(url, opt) {
+    var hit = textCache.get(url);
+    if (hit && Date.now() - hit.ts < 30000) {
+      textCache.delete(url);        // 只吃一次，别拿旧列表去播
+      return Promise.resolve(hit.text);
+    }
+    return xfetch(url, true, opt);
+  }
+
+  function seedText(url, text) {
+    if (!text || text.length > 2 * 1024 * 1024) return;
+    if (text.indexOf('#EXTM3U') < 0) return;
+    textCache.set(url, { text: text, ts: Date.now() });
+    if (textCache.size > 8) textCache.delete(textCache.keys().next().value);
+  }
+  function fetchBuf(url, opt) { return xfetch(url, false, opt); }
+
+  function qualityLabel(attrs) {
+    var res = attrs.RESOLUTION || '';
+    var m = /x(\d{3,4})$/i.exec(res);
+    if (m) return m[1] + 'P';
+    var bw = parseInt(attrs.BANDWIDTH || '0', 10);
+    if (bw >= 1000000) return (bw / 1000000).toFixed(1) + 'M';
+    if (bw) return Math.round(bw / 1000) + 'K';
+    return '默认';
+  }
+
+  function resolvePlaylist(url, depth) {
+    depth = depth || 0;
+    if (depth > 3) return Promise.reject(new Error('播放列表层级过深'));
+    return fetchText(url).then(function (text) {
+      if (text.indexOf('#EXT-X-STREAM-INF') < 0) return { text: text, url: url, variants: [], codecs: '' };
+
+      var lines = text.split(/\r?\n/);
+      var variants = [];
+      for (var i = 0; i < lines.length; i++) {
+        if (lines[i].indexOf('#EXT-X-STREAM-INF') === 0) {
+          var a = parseAttrs(lines[i]);
+          var bw = parseInt(a.BANDWIDTH || a['AVERAGE-BANDWIDTH'] || '0', 10);
+          var j = i + 1;
+          while (j < lines.length && (!lines[j].trim() || lines[j].charAt(0) === '#')) j++;
+          if (j < lines.length) {
+            variants.push({
+              url: absolutize2(lines[j].trim(), url),
+              bw: bw,
+              label: qualityLabel(a),
+              codecs: a.CODECS || ''
+            });
+          }
+        }
+      }
+      if (!variants.length) return { text: text, url: url, variants: [], codecs: '' };
+      variants.sort(function (x, y) { return y.bw - x.bw; });
+      var pruned = false;
+      for (var vj = 0; vj < variants.length && variantSet.size < 60; vj++) {
+        var vurl = variants[vj].url;
+        variantSet.add(vurl);
+        if (items.delete(vurl)) pruned = true;
+      }
+      if (pruned) {
+        listDirty = true;
+        if (sheetOpen) scheduleRender();
+        ensureFab();
+      }
+
+      return resolvePlaylist(variants[0].url, depth + 1).then(function (r) {
+        r.variants = variants;
+        r.codecs = variants[0].codecs || '';
+        return r;
+      });
+    });
+  }
+
+  var hlsPrefetchCount = 0;
+
+  function getPlaylist(url, maxAge) {
+    var now = Date.now();
+    var hit = playCache.get(url);
+    var ttl = (typeof maxAge === 'number') ? maxAge : 60000;   // 注意：0 是合法值，不能用 ||
+    if (hit && (hit.endlist === true || now - hit.ts < ttl)) return hit.p;
+
+    var rec = { ts: now, p: null, endlist: false };
+    rec.p = resolvePlaylist(url).then(function (r) {
+      var pl = parseMedia(r.text, r.url);
+      rec.endlist = (pl.endlist === true);
+
+      if (r.variants && r.variants.length && r.url !== url && !playCache.has(r.url)) {
+        playCache.set(r.url, {
+          ts: Date.now(),
+          endlist: rec.endlist,
+          p: Promise.resolve({ r: { text: r.text, url: r.url, variants: [], codecs: r.codecs }, pl: pl })
+        });
+        if (playCache.size > 16) {
+          var oldest = playCache.keys().next().value;
+          if (oldest !== url) playCache.delete(oldest);
+        }
+      }
+
+      if (pl.map && pl.map.uri) prefetchBuf(pl.map.uri, pl.map.range).catch(function () {});
+      return { r: r, pl: pl };
+    });
+    playCache.set(url, rec);
+    if (playCache.size > 16) playCache.delete(playCache.keys().next().value);
+
+    rec.p.catch(function () {
+      if (playCache.get(url) === rec) playCache.delete(url);
+    });
+    return rec.p;
+  }
+
+  function cacheKey(url, range) { return range ? url + '#' + range : url; }
+
+  function prefetchBuf(url, range) {
+    var k = cacheKey(url, range);
+    var hit = bufCache.get(k);
+    if (hit && Date.now() - hit.ts < 120000) return Promise.resolve(hit.buf);
+    return fetchBuf(url, { range: range }).then(function (buf) {
+      if (buf && buf.byteLength && buf.byteLength < 4 * 1024 * 1024) {
+        bufCache.set(k, { buf: buf, ts: Date.now() });
+        if (bufCache.size > 6) bufCache.delete(bufCache.keys().next().value);
+      }
+      return buf;
+    });
+  }
+
+  function getBufCached(url, range, signal) {
+    var k = cacheKey(url, range);
+    var hit = bufCache.get(k);
+    if (hit && Date.now() - hit.ts < 120000) return Promise.resolve(hit.buf);
+    return fetchBuf(url, { range: range, signal: signal });
+  }
+
+  function absolutize2(u, base) {
+    try { return new URL(u, base).href; } catch (e) { return u; }
+  }
+
+  function rangeOf(spec, lastEnd) {
+    if (!spec) return null;
+    var p = String(spec).split('@');
+    var len = parseInt(p[0], 10) || 0;
+    var off = p.length > 1 ? parseInt(p[1], 10) : (lastEnd || 0);
+    if (!len) return null;
+    return off + '-' + (off + len - 1);
+  }
+
+  function parseMedia(text, baseUrl) {
+    var lines = text.split(/\r?\n/);
+    var segs = [];
+    var key = null, map = null, dur = 0, endlist = false, mediaSeq = 0;
+    var pendingRange = null, lastRangeEnd = 0, gapNext = false;
+
+    for (var i = 0; i < lines.length; i++) {
+      var l = lines[i].trim();
+      if (!l) continue;
+      if (l.indexOf('#EXT-X-KEY') === 0) {
+        var ka = parseAttrs(l);
+        if (ka.METHOD === 'NONE') key = null;
+        else key = { method: ka.METHOD, uri: ka.URI ? absolutize2(ka.URI, baseUrl) : null, iv: ka.IV || null };
+      } else if (l.indexOf('#EXT-X-MAP') === 0) {
+        var ma = parseAttrs(l);
+        if (ma.URI) map = { uri: absolutize2(ma.URI, baseUrl), range: rangeOf(ma.BYTERANGE, 0), key: key };
+      } else if (l.indexOf('#EXT-X-BYTERANGE') === 0) {
+        var spec = l.slice(l.indexOf(':') + 1).split('@');
+        var len = parseInt(spec[0], 10) || 0;
+        var off = spec.length > 1 ? parseInt(spec[1], 10) : lastRangeEnd;
+        if (len) { pendingRange = { offset: off, length: len }; lastRangeEnd = off + len; }
+      } else if (l.indexOf('#EXTINF') === 0) {
+        var p = l.split(':')[1];
+        dur = parseFloat((p || '0').split(',')[0]) || 0;
+      } else if (l.indexOf('#EXT-X-MEDIA-SEQUENCE') === 0) {
+        mediaSeq = parseInt(l.split(':')[1], 10) || 0;
+      } else if (l.indexOf('#EXT-X-ENDLIST') === 0) {
+        endlist = true;
+      } else if (l.indexOf('#EXT-X-GAP') === 0) {
+        gapNext = true;   // 占位分片：时长留着占时间轴，但不下载
+      } else if (l.charAt(0) !== '#') {
+        segs.push({
+          url: absolutize2(l, baseUrl),
+          dur: dur,
+          key: key,
+          start: 0,
+          map: map,
+          gap: gapNext,
+          range: pendingRange ? (pendingRange.offset + '-' + (pendingRange.offset + pendingRange.length - 1)) : null
+        });
+        pendingRange = null;
+        gapNext = false;
+        dur = 0;
+      }
+    }
+
+    var t = 0;
+    for (var k = 0; k < segs.length; k++) {
+      segs[k].start = t;
+      t += segs[k].dur;
+    }
+    return { segs: segs, map: map, total: t, endlist: endlist, mediaSeq: mediaSeq };
+  }
+
+  function pickMime(isFmp4, codecs) {
+    var base = isFmp4 ? 'video/mp4' : 'video/mp2t';
+    var list = [];
+    if (codecs) list.push(base + '; codecs="' + codecs + '"');
+    list = list.concat(isFmp4 ? [
+      'video/mp4; codecs="avc1.42E01E,mp4a.40.2"',
+      'video/mp4; codecs="avc1.4D401F,mp4a.40.2"',
+      'video/mp4; codecs="avc1.64001F,mp4a.40.2"',
+      'video/mp4'
+    ] : [
+      'video/mp2t; codecs="avc1.42E01E,mp4a.40.2"',
+      'video/mp2t; codecs="avc1.4D401F,mp4a.40.2"',
+      'video/mp2t'
+    ]);
+    for (var i = 0; i < list.length; i++) {
+      try { if (window.MediaSource && MediaSource.isTypeSupported(list[i])) return list[i]; } catch (e) {}
+    }
+    return null;
+  }
+
+  var keyBytesCache = new Map();
+  var cryptoKeyCache = new Map();
+
+  function getKeyBytes(uri) {
+    if (!uri) return Promise.reject(new Error('缺少密钥地址'));
+    if (keyBytesCache.has(uri)) return keyBytesCache.get(uri);
+    var p = fetchBuf(uri);
+    keyBytesCache.set(uri, p);
+    p.catch(function () { keyBytesCache.delete(uri); });
+    return p;
+  }
+
+  function getCryptoKey(uri) {
+    if (!window.crypto || !crypto.subtle) return Promise.reject(new Error('页面非 HTTPS，解密接口不可用'));
+    if (cryptoKeyCache.has(uri)) return cryptoKeyCache.get(uri);
+    var p = getKeyBytes(uri).then(function (kb) {
+      return crypto.subtle.importKey('raw', kb, 'AES-CBC', false, ['decrypt']);
+    });
+    cryptoKeyCache.set(uri, p);
+    p.catch(function () { cryptoKeyCache.delete(uri); });
+    return p;
+  }
+
+  function decryptAes(data, key, seq) {
+    var iv;
+    if (key.iv) {
+      var raw = hexToBytes(key.iv.replace(/^0x/i, ''));
+      iv = new Uint8Array(16);
+      if (raw.length >= 16) iv.set(raw.subarray(raw.length - 16));
+      else if (raw.length) iv.set(raw, 16 - raw.length);
+    } else {
+      iv = new Uint8Array(16);
+      var n = seq;
+      for (var i = 15; i >= 0; i--) { iv[i] = n & 0xff; n = Math.floor(n / 256); }
+    }
+    return getCryptoKey(key.uri).then(function (ck) {
+      return crypto.subtle.decrypt({ name: 'AES-CBC', iv: iv }, ck, data);
+    });
+  }
+
+  function checkCryptoSupport(pl) {
+    if (!pl) return '';
+    var keys = [];
+    if (pl.map && pl.map.key) keys.push(pl.map.key);
+    for (var i = 0; i < pl.segs.length; i++) {
+      var k = pl.segs[i] && pl.segs[i].key;
+      if (k && keys.indexOf(k) < 0) keys.push(k);   // KEY 对象按行复用，去重后很少
+    }
+    for (var j = 0; j < keys.length; j++) {
+      var m = keys[j].method;
+      if (!m || m === 'NONE') continue;
+      if (m !== 'AES-128') return '不支持的加密方式 ' + m + '（仅支持 AES-128）';
+      if (!window.crypto || !crypto.subtle) return '加密流需要在 HTTPS 页面播放（内核限制）';
+    }
+    return '';
+  }
+
+  function appendTo(sb, buf) {
+    var prev = sb.__xbq || Promise.resolve();
+    var p = prev.then(function () {
+      return new Promise(function (res, rej) {
+        var done = false;
+        function ok() { if (done) return; done = true; cleanup(); res(); }
+        function bad(e) { if (done) return; done = true; cleanup(); rej(e || new Error('append 失败')); }
+        function cleanup() {
+          sb.removeEventListener('updateend', ok);
+          sb.removeEventListener('error', bad);
+        }
+        sb.addEventListener('updateend', ok);
+        sb.addEventListener('error', bad);
+        try { sb.appendBuffer(buf); } catch (e) { bad(e); }
+      });
+    });
+    sb.__xbq = p.catch(function () {});
+    return p;
+  }
+
+  function aheadSeconds(v) {
+    try {
+      var t = v.currentTime, b = v.buffered;
+      for (var i = 0; i < b.length; i++) {
+        if (t >= b.start(i) - 0.6 && t <= b.end(i)) return b.end(i) - t;
+      }
+      return b.length ? b.end(b.length - 1) - t : 0;
+    } catch (e) { return 0; }
+  }
+
+  function isBuffered(v, t) {
+    try {
+      var b = v.buffered;
+      for (var i = 0; i < b.length; i++) {
+        if (t >= b.start(i) && t <= b.end(i) - 0.15) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  function findSegIndex(segs, t) {
+    for (var i = 0; i < segs.length; i++) {
+      if (t < segs[i].start + segs[i].dur) return i;
+    }
+    return segs.length - 1;
+  }
+
+  function HlsPlayer(url, video, onState) {
+    this.url = url;
+    this.video = video;
+    this.onState = onState || function () {};
+    this.gen = 0;
+    this.dead = false;
+    this.segs = [];
+    this.map = null;
+    this.mediaSeq = 0;
+    this.ms = null;
+    this.sb = null;
+    this.mime = '';
+    this.objUrl = null;
+    this.pendingSeek = null;
+    this.restarting = false;
+    this.aligned = false;
+    this.autoPlay = true;
+    this.variants = [];
+    this.variantIndex = 0;
+    this.fails = new Map();
+    this.boundSeek = null;
+    this.ctrl = null;
+    this.seekTimer = 0;
+    this.transmux = false;
+    this.txmux = null;
+    this.txInit = null;
+    this.txOut = [];
+    this.ptsOffset = null;   // 流的 PTS 起点偏移，seek 时要用
+    this.softSeek = false;   // 正在往现有 MSE 里补跳转数据
+    this.softSeekT = 0;
+    this.softFailed = false;
+    this.hardRetried = false;
+    this.finished = false;    // 点播分片已经全部处理完
+    this.startedAt = 0;       // 实际起播位置（续播/跳片头生效时 > 0）
+  }
+
+  HlsPlayer.prototype.start = function (at, skip) {
+    var self = this;
+    return getPlaylist(this.url).then(function (c) {
+      var r = c.r, pl = c.pl;
+      if (!pl.segs.length) throw new Error('播放列表为空');
+      var encErr = checkCryptoSupport(pl);
+      if (encErr) throw new Error(encErr);
+      self.segs = pl.segs;
+      self.map = pl.map;
+      self.mediaSeq = pl.mediaSeq;
+      self.total = pl.total;
+      self.endlist = pl.endlist;
+      self.variants = r.variants || [];
+      self.variantIndex = 0;
+      for (var vi = 0; vi < self.variants.length; vi++) {
+        if (self.variants[vi].url === r.url) { self.variantIndex = vi; break; }
+      }
+      var mime = pickMime(!!pl.map, r.codecs);
+      self.transmux = false;
+      self.codecs = r.codecs || '';
+      if (!mime && !pl.map) {
+        mime = pickMime(true, r.codecs);
+        if (mime) self.transmux = true;
+      }
+      if (!mime) throw new Error('内核不支持该封装（可能是 HEVC）');
+      self.mime = mime;
+      self.bindSeek();
+      var t = 0;
+      if (at > 5 && (!self.total || at < self.total - 15)) t = at;
+      else if (skip > 0 && (!self.total || skip < self.total - 30)) t = skip;
+      self.startedAt = t;
+      return t > 0 ? self.load(findSegIndex(self.segs, t), t) : self.load(0, null);
+    });
+  };
+
+  HlsPlayer.prototype.switchTo = function (i) {
+    var self = this;
+    var vs = this.variants || [];
+    var v = vs[i];
+    if (!v) return Promise.reject(new Error('没有该清晰度'));
+    var t = this.video.currentTime || 0;
+    this.variantIndex = i;
+    this.url = v.url;
+    return getPlaylist(v.url, 0).then(function (c) {
+      var pl = c.pl;
+      if (!pl.segs.length) throw new Error('播放列表为空');
+      var encErr2 = checkCryptoSupport(pl);
+      if (encErr2) throw new Error(encErr2);
+      var mime = pickMime(!!pl.map, v.codecs);
+      self.transmux = false;
+      if (!mime && !pl.map) {
+        mime = pickMime(true, v.codecs);
+        if (mime) self.transmux = true;
+      }
+      if (!mime) throw new Error('该清晰度的编码不支持');
+      self.mime = mime;
+      self.segs = pl.segs;
+      self.map = pl.map;
+      self.mediaSeq = pl.mediaSeq;
+      self.total = pl.total;
+      self.endlist = pl.endlist;
+      self.autoPlay = true;
+      return self.load(findSegIndex(pl.segs, t), t);
+    });
+  };
+
+  HlsPlayer.prototype.prefetchAt = function (t) {
+    if (this.dead) return;
+    var i = findSegIndex(this.segs, t);
+    if (i < 0) return;
+    if (this._pfIdx === i) return;      // 同一片不重复发
+    var now = Date.now();
+    if (this._pfAt && now - this._pfAt < 200) return;   // 拖太快就别狂发请求
+    this._pfAt = now;
+    this._pfIdx = i;
+    var seg = this.segs[i];
+    if (!seg || seg.gap) return;
+    var key = cacheKey(seg.url, seg.range);
+    if (segCache.has(key)) return;
+    try {
+      fetchBuf(seg.url, { range: seg.range }).then(function (b) {
+        putSegCache(key, b);
+      }).catch(function () {});
+    } catch (e) {}
+  };
+
+  HlsPlayer.prototype.seekTransmux = function (t) {
+    if (this.dead || !this.txmux || !this.sb || !this.ms) return false;
+    if (this.ms.readyState !== 'open') return false;
+    if (this.ptsOffset == null) return false;   // 起播还没对齐时间轴，先整体重建更稳
+    var i = findSegIndex(this.segs, t);
+    if (i < 0) return false;
+    var muxjs = window.muxjs;
+    if (!muxjs) return false;
+
+    var wasPlaying = false;
+    try { wasPlaying = !this.video.paused; } catch (e) {}
+    if (this.ctrl) { try { this.ctrl.abort(); } catch (e) {} }
+    var gen = ++this.gen;
+    this.ctrl = new AbortController();
+    this.pendingSeek = t;
+    this.aligned = false;
+    this.softSeek = true;
+    this.softSeekT = t;
+    this.softFailed = false;
+    this.autoPlay = wasPlaying;
+    this.finished = false;
+
+    try {
+      this.txOut.length = 0;
+      this.txInit = null;
+      this.txmux = new muxjs.mp4.Transmuxer();
+      if (i > 0 && typeof this.txmux.setBaseMediaDecodeTime === 'function') {
+        this.txmux.setBaseMediaDecodeTime(Math.round(this.segs[i].start * 90000));
+      }
+      var self = this;
+      this.txmux.on('data', function (seg) {
+        if (!self.txInit && seg.initSegment && seg.initSegment.byteLength) self.txInit = seg.initSegment;
+        if (seg.data && seg.data.byteLength) self.txOut.push(seg.data);
+      });
+    } catch (e) {
+      this.softSeek = false;
+      return false;
+    }
+
+    showFreeze();
+    this.pump(i, gen, this.sb, null);
+    return true;
+  };
+
+  HlsPlayer.prototype.seekTo = function (t) {
+    if (this.dead) return;
+    var off = this.ptsOffset || 0;
+    var target = t + off;
+
+    if (isBuffered(this.video, target)) {
+      this.lastSetTime = Date.now();
+      try { this.video.currentTime = target; } catch (e) {}
+      return;
+    }
+
+    var i = findSegIndex(this.segs, t);
+    if (i < 0) return;
+
+    if (this.transmux) {
+      if (!this.seekTransmux(t)) {
+        var self0 = this;
+        this.load(i, t).catch(function () { self0.onState({ msg: '跳转失败，请重试', err: true }); });
+      }
+      return;
+    }
+
+    if (!this.sb || !this.ms || this.ms.readyState !== 'open' || this.ptsOffset == null) {
+      var self1 = this;
+      this.load(i, t).catch(function () { self1.onState({ msg: '跳转失败，请重试', err: true }); });
+      return;
+    }
+
+    if (this.ctrl) { try { this.ctrl.abort(); } catch (e) {} }
+    var gen = ++this.gen;
+    this.ctrl = new AbortController();
+    this.pendingSeek = t;
+    this.failStreak = 0;
+    this.softSeek = true;
+    this.softSeekT = t;
+    this.softFailed = false;
+    this.finished = false;
+    try {
+      this.video.currentTime = target;
+      this.lastSetTime = Date.now();
+    } catch (e) {}
+    var st = playerEl && playerEl.querySelector('.stat');
+    if (st) st.textContent = '缓冲中…';
+    this.pump(i, gen, this.sb, null);
+  };
+
+  HlsPlayer.prototype.reloadAt = function (t) {
+    var i = findSegIndex(this.segs, t);
+    return this.load(Math.max(0, i), t);
+  };
+
+  HlsPlayer.prototype.forceTransmux = function (t) {
+    var m = pickMime(true, this.codecs);
+    if (!m) return Promise.reject(new Error('内核也不支持 fMP4'));
+    this.mime = m;
+    this.transmux = true;
+    this.triedTransmux = true;
+    var i = findSegIndex(this.segs, t || 0);
+    return this.load(Math.max(0, i), t || null);
+  };
+
+  HlsPlayer.prototype.bindSeek = function () {
+    var self = this;
+    if (this.boundSeek) this.video.removeEventListener('seeking', this.boundSeek);
+    this.boundSeek = function () {
+      if (self.restarting || self.dead) return;
+      if (self.pendingSeek != null) return;
+      if (Date.now() - (self.lastSetTime || 0) < 800) return;
+      var t = self.video.currentTime;
+      if (isBuffered(self.video, t)) return;
+      clearTimeout(self.seekTimer);
+      self.seekTimer = setTimeout(function () {
+        if (self.dead || self.restarting) return;
+        var t2 = self.video.currentTime;
+        if (isBuffered(self.video, t2)) return;
+        self.seekTo(t2 - (self.ptsOffset || 0));
+      }, 260);
+    };
+    this.video.addEventListener('seeking', this.boundSeek);
+  };
+
+  HlsPlayer.prototype.load = function (index, seekTime) {
+    var self = this;
+    var gen = ++this.gen;
+
+    var wasPlaying = false;
+    try { wasPlaying = !this.video.paused; } catch (e) {}
+    if (wasPlaying) this.autoPlay = true;
+
+    if (this.ctrl) { try { this.ctrl.abort(); } catch (e) {} }
+    var ctrl = new AbortController();
+    this.ctrl = ctrl;
+
+    this.restarting = true;
+    if (playerEl && !playerEl.classList.contains('loading')) playerEl.classList.add('buffering');
+    this.pendingSeek = seekTime;
+    this.aligned = false;
+    this.ptsOffset = null;
+    this.softSeek = false;
+    this.finished = false;
+
+    var mapP = this.map ? getBufCached(this.map.uri, this.map.range) : null;
+    var muxP = this.transmux ? loadMux() : null;
+    var firstP = null;
+    if (!this.transmux && index < this.segs.length && !this.segs[index].gap) {
+      firstP = this.fetchSeg(this.segs[index], index, ctrl.signal);
+      firstP.catch(function () {});
+    }
+
+    try { this.video.pause(); } catch (e) {}
+    if (this.objUrl) { try { URL.revokeObjectURL(this.objUrl); } catch (e) {} this.objUrl = null; }
+    if (this.ms) { try { this.ms.endOfStream(); } catch (e) {} }
+    showFreeze();
+
+    var ms;
+    try { ms = new MediaSource(); } catch (e) { return Promise.reject(e); }
+    this.ms = ms;
+    this.objUrl = URL.createObjectURL(ms);
+    this.video.src = this.objUrl;
+
+    return new Promise(function (res, rej) {
+      var timer = setTimeout(function () { rej(new Error('MediaSource 打开超时')); }, 15000);
+      ms.addEventListener('sourceopen', function () { clearTimeout(timer); res(); }, { once: true });
+    }).then(function () {
+      if (gen !== self.gen) return;
+      var sb;
+      try { sb = ms.addSourceBuffer(self.mime); } catch (e) { throw new Error('addSourceBuffer 失败'); }
+      self.sb = sb;
+      try { sb.mode = 'segments'; } catch (e) {}
+
+      var initP = mapP ? mapP.then(function (b) {
+        if (self.map && self.map.key && self.map.key.method === 'AES-128') {
+          return decryptAes(b, self.map.key, self.mediaSeq).then(function (d) { return appendTo(sb, d); });
+        }
+        return appendTo(sb, b);
+      }) : Promise.resolve();
+
+      var prep = muxP ? muxP.then(function (muxjs) {
+        if (gen !== self.gen) return;
+        self.txOut.length = 0;
+        self.txInit = null;
+        self.txmux = new muxjs.mp4.Transmuxer();
+        if (index > 0 && typeof self.txmux.setBaseMediaDecodeTime === 'function') {
+          try { self.txmux.setBaseMediaDecodeTime(Math.round(self.segs[index].start * 90000)); } catch (e) {}
+        }
+        self.txmux.on('data', function (seg) {
+          if (!self.txInit && seg.initSegment && seg.initSegment.byteLength) self.txInit = seg.initSegment;
+          if (seg.data && seg.data.byteLength) self.txOut.push(seg.data);
+        });
+      }) : Promise.resolve();
+
+      return prep.then(function () {
+        return initP.then(function () {
+          if (gen !== self.gen) return;
+          self.restarting = false;
+          self.pump(index, gen, sb, firstP);
+        });
+      });
+    }).catch(function (e) {
+      if (gen === self.gen) {
+        self.restarting = false;
+        if (playerEl) playerEl.classList.remove('buffering');
+      }
+      throw e;
+    });
+  };
+
+  function concatBytes(list) {
+    var len = 0, i;
+    for (i = 0; i < list.length; i++) len += list[i].byteLength;
+    var out = new Uint8Array(len), off = 0;
+    for (i = 0; i < list.length; i++) {
+      out.set(new Uint8Array(list[i]), off);
+      off += list[i].byteLength;
+    }
+    return out;
+  }
+
+  function appendChunk(sb, chunk) {
+    if (!chunk || !chunk.data) return appendTo(sb, chunk);
+    var p = chunk.init ? appendTo(sb, chunk.init) : Promise.resolve();
+    return p.then(function () { return appendTo(sb, chunk.data); });
+  }
+
+  HlsPlayer.prototype.fetchSeg = function (seg, i, signal) {
+    var self = this;
+    var myGen = this.gen;
+    var key = cacheKey(seg.url, seg.range);
+    var hit = segCache.get(key);
+    if (hit) hit.ts = Date.now();   // LRU：刚用过的分片不该先被淘汰
+    var p = hit
+      ? Promise.resolve(hit.buf)
+      : fetchBuf(seg.url, { range: seg.range, signal: signal }).then(function (buf) {
+          putSegCache(key, buf);
+          return buf;
+        });
+    return p.then(function (buf) {
+      var kp = (seg.key && seg.key.method === 'AES-128')
+        ? decryptAes(buf, seg.key, self.mediaSeq + i)
+        : Promise.resolve(buf);
+      return kp.then(function (data) {
+        if (self.gen !== myGen) {
+          var st = new Error('stale segment');
+          st.name = 'AbortError';
+          throw st;
+        }
+        return self.transmux ? self.txSegment(data) : data;
+      });
+    });
+  };
+
+  HlsPlayer.prototype.txSegment = function (ts) {
+    if (!this.txmux) return Promise.reject(new Error('转封装器未就绪'));
+    this.txOut.length = 0;
+    this.txInit = null;
+    try {
+      this.txmux.push(new Uint8Array(ts));
+      this.txmux.flush();
+    } catch (e) { return Promise.reject(e); }
+
+    var init = this.txInit, out = this.txOut.slice();
+    this.txOut.length = 0;
+    this.txInit = null;
+    if (!out.length) return Promise.reject(new Error('转封装无输出'));
+    return Promise.resolve({ init: init, data: concatBytes(out) });
+  };
+
+  HlsPlayer.prototype.settle = function (index, tries, gen) {
+    var self = this;
+    if (this.dead || gen !== this.gen) return;   // 期间又发起新 load 就作废
+
+    var b = null;
+    try {
+      if (this.sb && this.sb.buffered && this.sb.buffered.length) b = this.sb.buffered;
+      else if (this.video.buffered.length) b = this.video.buffered;
+    } catch (e) {}
+    if ((!b || !b.length) && tries < 60) {   // 最多等 3 秒，网络慢时也不放弃
+      setTimeout(function () { self.settle(index, tries + 1, gen); }, 50);
+      return;
+    }
+
+    if (b && b.length) {
+      if (this.ptsOffset == null) {
+        var first = this.segs[index] ? this.segs[index].start : 0;
+        this.ptsOffset = b.start(0) - first;
+      }
+
+      if (this.endlist && this.total > 0 && this.ms) {
+        this.setDuration(this.total + Math.max(0, this.ptsOffset || 0), 0, gen);
+      }
+      try {
+        if (this.pendingSeek != null) {
+          var t = this.pendingSeek;
+          this.pendingSeek = null;
+          this.softSeek = false;
+          this.softSeekT = 0;
+          this.lastSetTime = Date.now();
+          var target = t + (this.ptsOffset || 0);
+          this.video.currentTime = target;
+          if (!isBuffered(this.video, target)) {
+            this.video.currentTime = b.start(0) + 0.05;
+          }
+        } else if (!isBuffered(this.video, this.video.currentTime)) {
+          this.lastSetTime = Date.now();
+          this.video.currentTime = b.start(0) + 0.05;
+        }
+      } catch (e) {}
+    }
+
+    if (this.autoPlay) {
+      this.autoPlay = false;
+      if (!userPaused) safePlay(this.video);
+    }
+  };
+
+  HlsPlayer.prototype.finalizeDuration = function () {
+    var self = this;
+    if (this.dead || !this.ms || !(this.endlist && this.total > 0)) return;
+    var ms0 = this.ms, sb0 = this.sb, myGen = this.gen;
+    var tries = 0;
+    function run() {
+      if (self.dead || self.gen !== myGen || self.ms !== ms0) return;
+      if (sb0 && sb0.updating) {
+        if (tries++ < 40) setTimeout(run, 50);
+        return;
+      }
+      var end = 0;
+      try {
+        var b = (sb0 && sb0.buffered) || (self.video && self.video.buffered);
+        if (b && b.length) end = b.end(b.length - 1);
+      } catch (e) { return; }
+      if (!end) return;
+      var expected = self.total + Math.max(0, self.ptsOffset || 0);
+      if (Math.abs(end - expected) > 2) return;
+      try { ms0.duration = end; return; } catch (e) {}
+
+      try {
+        var oldDur = expected;
+        try { oldDur = ms0.duration || expected; } catch (e) {}
+        if (!(end < oldDur)) return;
+        var onUp = function () {
+          try { sb0.removeEventListener('updateend', onUp); } catch (e) {}
+          if (self.dead || self.gen !== myGen || self.ms !== ms0) return;
+          try { ms0.duration = end; } catch (e2) {}
+        };
+        sb0.addEventListener('updateend', onUp);
+        try { sb0.remove(end, oldDur); }
+        catch (e) { try { sb0.removeEventListener('updateend', onUp); } catch (e2) {} }
+      } catch (e) {}
+    }
+    run();
+  };
+
+  HlsPlayer.prototype.setDuration = function (val, tries, gen) {
+    var self = this;
+    if (this.dead || gen !== this.gen) return;
+    if (this.sb && this.sb.updating) {
+      if (tries < 20) setTimeout(function () { self.setDuration(val, tries + 1, gen); }, 50);
+      return;
+    }
+    try { this.ms.duration = val; } catch (e) {}
+  };
+
+  HlsPlayer.prototype.pump = function (index, gen, sb, firstP) {
+    var self = this;
+    var i = index;
+    var signal = this.ctrl ? this.ctrl.signal : undefined;
+
+    function step() {
+      if (self.dead || gen !== self.gen) return;
+      if (i >= self.segs.length) {
+        if (!(self.endlist && self.total > 0)) {
+          try { if (self.ms && self.ms.readyState === 'open') self.ms.endOfStream(); } catch (e) {}
+        } else {
+          self.finished = true;
+          if (self.finalizeDuration) self.finalizeDuration();
+        }
+        return;
+      }
+      if (self.pendingSeek == null && aheadSeconds(self.video) > 60) {
+        setTimeout(step, 300);
+        return;
+      }
+
+      var seg = self.segs[i];
+      if (seg.gap) { i++; setTimeout(step, 0); return; }   // 占位分片：不请求，时间轴留着
+      var p = (i === index && firstP) ? firstP : self.fetchSeg(seg, i, signal);
+      if (i === index) firstP = null;
+
+      p.then(function (buf) {
+        if (self.dead || gen !== self.gen) return;
+        return appendChunk(sb, buf).then(function () {
+          self.failStreak = 0;
+          i++;
+          if (!self.aligned || self.pendingSeek != null) {
+            self.aligned = true;
+            self.settle(index, 0, gen);   // 等 buffered 可用后再对齐/设时长/起播
+          }
+          self.onState({ buffered: i, total: self.segs.length });
+          setTimeout(step, 0);
+        });
+      }).catch(function (e) {
+        if (e && e.name === 'AbortError') return;   // 主动取消，不算失败
+        if (self.softSeek && !self.softFailed) {
+          self.softFailed = true;
+          var softT = self.softSeekT;
+          self.softSeek = false;
+          self.onState({ msg: '正在恢复…' });
+          var retryP;
+          if (!self.transmux && /^video\/mp2t/i.test(self.mime || '')) {
+            retryP = self.forceTransmux(softT);   // 内核自称支持 mp2t 但补数据失败：改用转封装
+          } else {
+            retryP = self.load(findSegIndex(self.segs, softT), softT);
+          }
+          retryP.catch(function () {
+            self.onState({ msg: '跳转失败，请重试', err: true });
+          });
+          return;
+        }
+        var n = (self.fails.get(i) || 0) + 1;
+        self.fails.set(i, n);
+        if (n >= 3) {
+          self.failStreak = (self.failStreak || 0) + 1;
+          if (self.failStreak > 6) {
+            if (!self.hardRetried) {
+              self.hardRetried = true;
+              self.failStreak = 0;
+              var rt = self.pendingSeek != null ? self.pendingSeek
+                : Math.max(0, (self.video.currentTime || 0) - (self.ptsOffset || 0));
+              self.onState({ msg: '正在恢复…' });
+              self.load(findSegIndex(self.segs, rt), rt).catch(function () {
+                self.onState({ msg: '跳转失败，请重试', err: true });
+              });
+              return;
+            }
+            self.dead = true;
+            self.onState({ msg: '解码失败，请重试或下载', err: true });
+            return;
+          }
+          i++;
+          setTimeout(step, 0);
+        } else setTimeout(step, 700);
+      });
+    }
+    step();
+  };
+
+  HlsPlayer.prototype.destroy = function () {
+    this.dead = true;
+    this.gen++;
+    clearTimeout(this.seekTimer);
+    if (this.ctrl) { try { this.ctrl.abort(); } catch (e) {} this.ctrl = null; }
+    if (this.boundSeek) { try { this.video.removeEventListener('seeking', this.boundSeek); } catch (e) {} }
+    try { if (this.ms) this.ms.endOfStream(); } catch (e) {}
+    if (this.objUrl) { try { URL.revokeObjectURL(this.objUrl); } catch (e) {} }
+  };
+
+  /* ------------------------------------------------------------------ *
+   *  下载
+   * ------------------------------------------------------------------ */
+  /* ------------------------------------------------------------------ *
+   *  下载管理存储（OPFS，按站点隔离）
+   *  网页脚本只能用本源存储：A 站下的文件只在 A 站可见。
+   *  OPFS 不可用的老内核退化为内存暂存（提示用户及时导出）。
+   * ------------------------------------------------------------------ */
+  var dlMem = new Map();          // 内存兜底：id -> Blob
+  var dlDir = null;               // OPFS 目录句柄
+  var dlMan = { files: [] };      // [{id,name,mime,size,ts,page,path?}]
+  var dlReady = null;
+  var dlMemWarned = false;
+  var dlActive = 0;               // 进行中的下载数（面板里提示用）
+  var partsDir = null;            // parts/ 目录（断点续传分片）
+  var dlTasks = [];               // 未完成任务清单
+
+  function dlInit() {
+    if (dlReady) return dlReady;
+    dlReady = Promise.resolve().then(function () {
+      if (!navigator.storage || !navigator.storage.getDirectory) return null;
+      return navigator.storage.getDirectory();
+    }).then(function (root) {
+      if (!root) return null;
+      return root.getDirectoryHandle('__xbvk_dl__', { create: true });
+    }).then(function (dir) {
+      if (!dir) return null;
+      dlDir = dir;
+      try { if (navigator.storage.persist) navigator.storage.persist().catch(function () {}); } catch (e) {}
+      var manP = dlDir.getFileHandle('manifest.json').then(function (fh) {
+        return fh.getFile();
+      }).then(function (file) {
+        return file.text();
+      }).then(function (txt) {
+        var man = JSON.parse(txt);
+        if (man && man.files) dlMan = man;
+      }).catch(function () {});
+      var taskP = dlDir.getDirectoryHandle('parts', { create: true }).then(function (p) {
+        partsDir = p;
+        return p.getFileHandle('tasks.json');
+      }).then(function (fh) {
+        return fh.getFile();
+      }).then(function (file) {
+        return file.text();
+      }).then(function (txt) {
+        var arr = JSON.parse(txt);
+        if (Object.prototype.toString.call(arr) === '[object Array]') dlTasks = arr;
+      }).catch(function () {});
+      return Promise.all([manP, taskP]);
+    }).then(function () {
+      if (!dlDir) return;
+      var checks = dlMan.files.map(function (f) {
+        return dlEntryFile(f).then(function (h) { return h.getFile(); }).then(function (file) {
+          f.size = file.size;
+          return f;
+        }).catch(function () { return null; });
+      });
+      return Promise.all(checks).then(function (alive) {
+        dlMan.files = alive.filter(function (f) { return f; });
+      });
+    }).catch(function () {});
+    return dlReady;
+  }
+
+  // 文件条目 → 句柄（path 形如 parts/<id>/data.bin：续传完成的直链文件直接住 parts 里）
+  function dlEntryFile(f) {
+    if (!dlDir) return Promise.reject(new Error('存储不可用'));
+    if (!f.path) return dlDir.getFileHandle(f.id + '.bin');
+    var seg = f.path.split('/');
+    return dlDir.getDirectoryHandle(seg[0]).then(function (d0) {
+      return d0.getDirectoryHandle(seg[1]);
+    }).then(function (d1) {
+      return d1.getFileHandle(seg[2]);
+    });
+  }
+
+  /* ---------- 断点续传：任务表 + 分片读写 ---------- */
+
+  var taskFlushPend = false;
+  function taskFlush(now) {
+    if (!partsDir) return Promise.resolve();
+    var run = function () {
+      taskFlushPend = false;
+      return partsDir.getFileHandle('tasks.json', { create: true }).then(function (h) {
+        return h.createWritable();
+      }).then(function (w) {
+        return w.write(new Blob([JSON.stringify(dlTasks)], { type: 'application/json' })).then(function () {
+          return w.close();
+        });
+      }).catch(function () {});
+    };
+    if (now) return run();
+    if (taskFlushPend) return Promise.resolve();
+    taskFlushPend = true;
+    return sleep(600).then(run);
+  }
+
+  function taskDirOf(id, create) {
+    if (!partsDir) return Promise.reject(new Error('不支持续传'));
+    return partsDir.getDirectoryHandle(id, { create: !!create });
+  }
+
+  function writePart(id, idx, buf) {
+    return taskDirOf(id, true).then(function (d) {
+      return d.getFileHandle(String(idx), { create: true });
+    }).then(function (h) {
+      return h.createWritable();
+    }).then(function (w) {
+      return w.write(buf).then(function () { return w.close(); });
+    });
+  }
+
+  function readPart(id, idx) {
+    return taskDirOf(id, false).then(function (d) {
+      return d.getFileHandle(String(idx));
+    }).then(function (h) {
+      return h.getFile();
+    });
+  }
+
+  // keepParts：直链任务收尾时文件已成成品，只清任务条目不动文件
+  function taskRemove(id, keepParts) {
+    for (var i = 0; i < dlTasks.length; i++) {
+      if (dlTasks[i].id === id) { dlTasks.splice(i, 1); break; }
+    }
+    var p = (partsDir && !keepParts)
+      ? partsDir.removeEntry(id, { recursive: true }).catch(function () {})
+      : Promise.resolve();
+    return p.then(function () { return taskFlush(true); });
+  }
+
+  function findTask(url, kind) {
+    for (var i = 0; i < dlTasks.length; i++) {
+      if (dlTasks[i].url === url && (!kind || dlTasks[i].kind === kind)) return dlTasks[i];
+    }
+    return null;
+  }
+
+  function segsMatch(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i].url !== b[i].url || (a[i].range || '') !== (b[i].range || '')) return false;
+    }
+    return true;
+  }
+
+  function dlWarnMem() {
+    if (dlMemWarned) return;
+    dlMemWarned = true;
+    toast('内核不支持内部存储：文件暂存内存，退出页面就没了，请下完点「保存/分享」导出');
+  }
+
+  function dlFlush() {
+    if (!dlDir) return Promise.resolve();
+    return dlDir.getFileHandle('manifest.json', { create: true }).then(function (h) {
+      return h.createWritable();
+    }).then(function (w) {
+      return w.write(new Blob([JSON.stringify(dlMan)], { type: 'application/json' })).then(function () {
+        return w.close();
+      });
+    }).catch(function () {});
+  }
+
+  function dlUniqueName(name) {
+    var has = {};
+    dlMan.files.forEach(function (f) { has[f.name] = 1; });
+    if (!has[name]) return name;
+    var dot = name.lastIndexOf('.');
+    var base = dot > 0 ? name.slice(0, dot) : name;
+    var ext = dot > 0 ? name.slice(dot) : '';
+    for (var n = 1; ; n++) {
+      var cand = base + ' (' + n + ')' + ext;
+      if (!has[cand]) return cand;
+    }
+  }
+
+  // opt.taskId：续传任务模式（文件写进 parts/<taskId>/data.bin，名字沿用任务的）；
+  // opt.append + opt.offset：Range 续传，在已有文件末尾接着写
+  function dlBegin(name, mime, opt) {
+    opt = opt || {};
+    var id = opt.taskId || (Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+    var uname = opt.taskId ? name : dlUniqueName(name);
+    var mimeUsed = mime || '';
+    var chunks = [];
+    var handle = null;
+    var writer = null;
+
+    var fileP = opt.taskId
+      ? taskDirOf(opt.taskId, true).then(function (d) {
+          return d.getFileHandle('data.bin', { create: true });
+        })
+      : (dlDir
+          ? dlDir.getFileHandle(id + '.bin', { create: true })
+          : Promise.resolve(null));
+
+    var pre = fileP.then(function (h) {
+      if (!h) return null;
+      handle = h;
+      return h.createWritable(opt.append ? { keepExistingData: true } : undefined);
+    }).then(function (w) {
+      if (!handle) return;
+      writer = w;
+      if (opt.append && writer) return writer.seek(opt.offset).then(function () {});
+    });
+
+    return pre.then(function () {
+      if (!writer) dlWarnMem();
+      return {
+        name: uname,
+        setMime: function (m) { if (m) mimeUsed = m; },
+        write: function (buf) {
+          if (writer) return writer.write(buf);
+          chunks.push(buf);
+          return Promise.resolve();
+        },
+        close: function () {
+          if (writer) return writer.close();
+          return Promise.resolve();
+        },
+        finish: function () {
+          var fp = writer
+            ? handle.getFile()
+            : Promise.resolve(new Blob(chunks, { type: mimeUsed || 'application/octet-stream' }));
+          return fp.then(function (file) {
+            var entry = {
+              id: id, name: uname,
+              mime: mimeUsed || file.type || '',
+              size: file.size, ts: Date.now(), page: location.host
+            };
+            if (opt.taskId) entry.path = 'parts/' + opt.taskId + '/data.bin';
+            if (!writer) dlMem.set(id, file);
+            dlMan.files.unshift(entry);
+            return dlFlush().then(function () { return entry; });
+          });
+        },
+        fail: function () {
+          // 任务模式的半成品必须留着续传（received 只在写成功后推进，
+          // 多写的字节会被下次 seek(offset) 覆盖，数据始终自洽）
+          var p = writer
+            ? writer.abort().catch(function () {}).then(function () {
+                if (opt.taskId) return;
+                return dlDir.removeEntry(id + '.bin').catch(function () {});
+              })
+            : Promise.resolve();
+          return p;
+        }
+      };
+    });
+  }
+
+  function dlPut(blob, name, mime) {
+    return dlInit().then(function () {
+      return dlBegin(name, mime || (blob && blob.type) || '');
+    }).then(function (t) {
+      return t.write(blob).then(function () { return t.close(); }).then(function () { return t.finish(); });
+    });
+  }
+
+  function dlGetBlob(f) {
+    if (dlDir) {
+      return dlEntryFile(f).then(function (h) { return h.getFile(); });
+    }
+    var b = dlMem.get(f.id);
+    return b ? Promise.resolve(b) : Promise.reject(new Error('文件不存在（重启后内存暂存会失效）'));
+  }
+
+  function dlRemove(f) {
+    dlMan.files = dlMan.files.filter(function (x) { return x.id !== f.id; });
+    dlMem.delete(f.id);
+    var p;
+    if (!dlDir) p = Promise.resolve();
+    else if (f.path) {
+      // parts/<id>/... 的成品文件：连目录一起删
+      p = dlDir.getDirectoryHandle(f.path.split('/')[0]).then(function (d0) {
+        return d0.removeEntry(f.path.split('/')[1], { recursive: true });
+      }).catch(function () {});
+    } else {
+      p = dlDir.removeEntry(f.id + '.bin').catch(function () {});
+    }
+    return p.then(function () { return dlFlush(); });
+  }
+
+  function dlClearAll() {
+    var ids = dlMan.files.slice();
+    dlMan.files = [];
+    dlMem.clear();
+    dlTasks = [];
+    var p = dlDir
+      ? Promise.all(ids.map(function (f) {
+          if (f.path) return Promise.resolve();
+          return dlDir.removeEntry(f.id + '.bin').catch(function () {});
+        })).then(function () {
+          // parts 整棵删掉（含所有分片和未完成任务），再重建空目录
+          return dlDir.removeEntry('parts', { recursive: true }).catch(function () {});
+        }).then(function () {
+          return dlDir.getDirectoryHandle('parts', { create: true });
+        }).then(function (p2) { partsDir = p2; })
+      : Promise.resolve();
+    return p.then(function () { return dlFlush(); });
+  }
+
+  function exportBlob(blob, name) {
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    a.rel = 'noopener';
+    a.style.display = 'none';
+    (document.body || document.documentElement).appendChild(a);
+    var ok = false;
+    try { a.click(); ok = true; } catch (e) {}
+    setTimeout(function () { try { a.remove(); } catch (e) {} }, 8000);
+    setTimeout(function () { try { URL.revokeObjectURL(url); } catch (e) {} }, 600000);
+    if (ok) toast('已导出：' + name + '（没反应就长按链接另存）');
+    else toast('导出没成功，请长按链接另存');
+  }
+
+  function shareFile(blob, name, mime) {
+    var file = null;
+    try { file = new File([blob], name, { type: mime || (blob && blob.type) || 'application/octet-stream' }); } catch (e) {}
+    if (file && navigator.canShare && navigator.canShare({ files: [file] })) {
+      var p;
+      try { p = navigator.share({ files: [file], title: name }); } catch (e) { p = Promise.reject(e); }
+      return Promise.resolve(p).then(function () {}, function (err) {
+        if (err && err.name === 'AbortError') return;   // 用户取消面板，不算失败
+        exportBlob(blob, name);
+      });
+    }
+    exportBlob(blob, name);
+  }
+
+  function anchorDownload(url, name) {
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    a.target = '_blank';
+    a.rel = 'noopener';
+    a.style.display = 'none';
+    (document.body || document.documentElement).appendChild(a);
+    try { a.click(); } catch (e) {}
+    setTimeout(function () { try { a.remove(); } catch (e) {} }, 8000);
+  }
+
+  function downloadItem(it, resumeTask) {
+    if (!it) return;
+    var name = it.title || 'video';
+
+    if (it.kind === 'hls') return downloadHls(it);
+    if (it.kind === 'dash') { copyText(it.url); toast('DASH 地址已复制'); return; }
+
+    if (it.blob) {
+      dlPut(it.blob, name + extOf(it), it.mime).then(function (ent) {
+        toast('已存入下载管理：' + ent.name);
+        renderDownloads();
+      }, function () { toast('保存失败，请重试'); });
+      return;
+    }
+
+    var pg = showProgress('准备下载…');
+    var ctrl = new AbortController();
+    pg.onCancel = function () { try { ctrl.abort(); } catch (e) {} };
+    dlActive++;
+    renderDownloads();
+
+    var task = null, t = null;
+    var resR = null, resAppend = false, total = 0, offset0 = 0;
+
+    dlInit().then(function () {
+      task = resumeTask || findTask(it.url, 'direct');
+      offset0 = (task && task.received) || 0;
+      var fname = task ? task.name : name + extOf(it);
+      var taskMode = !!partsDir;      // 只有 OPFS 模式支持续传
+
+      var fetchP;
+      if (taskMode && task && offset0 > 0) {
+        // 断点续传：从已下位置接着拉
+        fetchP = netFetch(it.url, {
+          credentials: 'same-origin', signal: ctrl.signal,
+          headers: { Range: 'bytes=' + offset0 + '-' }
+        }).then(function (r) {
+          if (r.status === 206) return { r: r, append: true };
+          if (r.ok) return { r: r, append: false };    // 服务器不理 Range：老实重下
+          throw new Error('HTTP ' + r.status);
+        }, function (e) {
+          if (e && e.name === 'AbortError') throw e;
+          // Range 可能引发 CORS 预检被拒：退回普通 GET 重下
+          return netFetch(it.url, { credentials: 'same-origin', signal: ctrl.signal }).then(function (r2) {
+            if (!r2.ok) throw new Error('HTTP ' + r2.status);
+            return { r: r2, append: false };
+          });
+        });
+      } else {
+        fetchP = netFetch(it.url, { credentials: 'same-origin', signal: ctrl.signal }).then(function (r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return { r: r, append: false };
+        });
+      }
+
+      return fetchP.then(function (res) {
+        resR = res.r;
+        resAppend = res.append;
+        total = parseInt(resR.headers.get('content-length') || '0', 10) || 0;
+        if (resAppend && total) total += offset0;   // 206 的 content-length 是剩余量
+        var type = resR.headers.get('content-type') || '';
+
+        if (taskMode && !task) {
+          task = {
+            id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+            kind: 'direct', name: dlUniqueName(fname), url: it.url,
+            mime: /^(video|audio|image|text)\//i.test(type) ? type : '',
+            page: location.host, ts: Date.now(),
+            received: 0, total: total
+          };
+          dlTasks.unshift(task);
+          taskFlush(true);
+        }
+        if (task && total) task.total = total;
+
+        var opt = (taskMode && task)
+          ? { taskId: task.id, append: resAppend, offset: resAppend ? offset0 : 0 }
+          : undefined;
+        return dlBegin(task ? task.name : fname, type, opt);
+      }).then(function (bt) {
+        t = bt;
+        if (!t) throw new Error('存储初始化失败');
+        if (!resR.body || !resR.body.getReader) {
+          return resR.blob().then(function (b) {
+            return t.write(b).then(function () { return t.close(); });
+          });
+        }
+        var reader = resR.body.getReader();
+        var got = resAppend ? offset0 : 0;
+        var base = got, lastPaint = 0, lastFlush = 0;
+        var rate = rateTracker();
+        function loop() {
+          return reader.read().then(function (rr) {
+            if (rr.done) return t.close();
+            got += rr.value.length;
+            var wq = t.write(rr.value);
+            var now = Date.now();
+            if (now - lastPaint > 250) {
+              lastPaint = now;
+              var bps = rate(now, got - base);
+              if (total) {
+                pg.progress(got, total);
+                pg.sub(fmtRate(bps) + (bps > 0 ? ' · 剩余 ' + fmtEta((total - got) / bps) : ''));
+              } else {
+                pg.set('已下载 ' + fmtBytes(got));
+                pg.sub(fmtRate(bps));
+              }
+            }
+            var fl = Promise.resolve();
+            if (task && now - lastFlush > 2500) {   // 进度定期落盘，杀进程也能续
+              lastFlush = now;
+              task.received = got;
+              fl = taskFlush();
+            }
+            return wq.then(function () { return fl; }).then(loop);
+          });
+        }
+        return loop();
+      }).then(function () {
+        return t.finish();
+      }).then(function (ent) {
+        dlActive--;
+        pg.close();
+        var fin = (task && partsDir) ? taskRemove(task.id, true) : Promise.resolve();
+        return fin.then(function () {
+          toast('已存入下载管理：' + ent.name);
+          renderDownloads();
+        });
+      }, function (err) {
+        dlActive--;
+        var failP = t ? t.fail() : Promise.resolve();
+        return failP.then(function () {
+          pg.close();
+          if (err && err.name === 'AbortError') {
+            if (task) { taskFlush(true); toast('已暂停，可在下载管理继续'); }
+            else toast('已取消下载');
+            renderDownloads();
+            return;
+          }
+          if (task) {
+            taskFlush(true);
+            toast('下载中断：进度已保存，可在下载管理继续');
+            renderDownloads();
+            return;
+          }
+          anchorDownload(it.url, name + extOf(it));
+          toast('直接下载被限制，已转交浏览器下载');
+        });
+      });
+    }).catch(function (err) {
+      dlActive--;
+      pg.close();
+      toast('下载启动失败：' + ((err && err.message) || '存储不可用'));
+    });
+  }
+
+  function extOf(it) {
+    if (it.kind === 'webm') return '.webm';
+    if (it.kind === 'flv') return '.flv';
+    if (it.kind === 'ts') return '.ts';
+    var m = it.mime || '';
+    if (/webm/i.test(m)) return '.webm';
+    if (/matroska/i.test(m)) return '.mkv';
+    if (/quicktime/i.test(m)) return '.mov';
+    return '.mp4';
+  }
+
+  var MUX_CDN = 'https://cdn.jsdelivr.net/npm/mux.js@7.0.3/dist/mux.min.js';
+  var muxPromise = null;
+
+  function loadMux() {
+    if (window.muxjs) return Promise.resolve(window.muxjs);
+    if (muxPromise) return muxPromise;
+    muxPromise = new Promise(function (res, rej) {
+      var done = false;
+      var s = document.createElement('script');
+      s.src = MUX_CDN;
+      s.onload = function () {
+        if (done) return;
+        done = true;
+        if (window.muxjs) res(window.muxjs);
+        else rej(new Error('mux.js 不可用'));
+      };
+      s.onerror = function () { if (done) return; done = true; rej(new Error('mux.js 加载失败')); };
+      (document.head || document.documentElement).appendChild(s);
+      setTimeout(function () { if (!done) { done = true; rej(new Error('mux.js 加载超时')); } }, 8000);
+    });
+    muxPromise.catch(function () { muxPromise = null; });
+    return muxPromise;
+  }
+
+  function blobToBuffer(x) {
+    if (x && typeof x.arrayBuffer === 'function') return x.arrayBuffer();
+    return Promise.resolve(x);   // 已经是 ArrayBuffer
+  }
+
+  function remuxToMp4(parts, onProgress) {
+    return loadMux().then(function (muxjs) {
+      return new Promise(function (res, rej) {
+        var t = new muxjs.mp4.Transmuxer();
+        var init = null, blobs = [];
+        var idx = 0, settled = false, tries = 0;
+
+        function finish(ok, val) {
+          if (settled) return;
+          settled = true;
+          if (ok) res(val); else rej(val);
+        }
+
+        t.on('data', function (seg) {
+          if (!init && seg.initSegment && seg.initSegment.byteLength) init = seg.initSegment;
+          if (seg.data && seg.data.byteLength) blobs.push(new Blob([seg.data]));
+        });
+
+        function complete() {
+          if (settled) return;
+          if ((!init || !blobs.length) && tries++ < 20) { setTimeout(complete, 25); return; }
+          if (!init || !blobs.length) { finish(false, new Error('转封装失败')); return; }
+          finish(true, new Blob([init].concat(blobs), { type: 'video/mp4' }));
+        }
+
+        function chunk() {
+          if (settled) return;
+          var end = Math.min(idx + 4, parts.length);
+          var batch = [];
+          for (; idx < end; idx++) batch.push(parts[idx]);
+
+          Promise.all(batch.map(blobToBuffer)).then(function (bufs) {
+            if (settled) return;
+            for (var k = 0; k < bufs.length; k++) {
+              try {
+                t.push(new Uint8Array(bufs[k]));
+                t.flush();
+              } catch (e) { finish(false, e); return; }
+            }
+            if (onProgress) onProgress(idx, parts.length);
+            if (idx < parts.length) setTimeout(chunk, 0);
+            else setTimeout(complete, 0);
+          }).catch(function (e) { finish(false, e); });
+        }
+        chunk();
+        setTimeout(function () { finish(false, new Error('转封装超时')); }, 60000);
+      });
+    });
+  }
+
+  function downloadHls(it, resumeTask) {
+    var pg = showProgress('解析播放列表…');
+    var ctrl = new AbortController();
+    pg.onCancel = function () { try { ctrl.abort(); } catch (e) {} };
+    dlActive++;
+    renderDownloads();
+
+    var name = it.title || (resumeTask && resumeTask.name) || 'video';
+    var tasks = [], results = [], pl = null, doneCount = 0, failed = 0, streak = 0;
+    var gotBytes = 0, lastPaint = 0, lastFlush = 0, rate = rateTracker();
+    var THREADS = 6;
+    var task = null;          // 续传任务对象（直播流/内存兜底时保持 null）
+
+    function grab(t, attempt) {
+      var p = t.isMap
+        ? getBufCached(t.url, t.range, ctrl.signal)
+        : fetchBuf(t.url, { range: t.range, signal: ctrl.signal });
+
+      return p.then(function (buf) {
+        if (t.key && t.key.method === 'AES-128') return decryptAes(buf, t.key, t.seq);
+        return buf;
+      }).catch(function (e) {
+        if ((e && e.name === 'AbortError') || ctrl.signal.aborted) throw e;
+        if (attempt >= 2) {
+          failed++;
+          streak++;
+          var limit = Math.max(3, Math.ceil(tasks.length * 0.15));
+          if (streak >= 8 || failed > limit) throw new Error('分片连续失败，已中止');
+          return null;
+        }
+        return sleep(400 * (attempt + 1)).then(function () { return grab(t, attempt + 1); });
+      });
+    }
+
+    // 从下载页签「继续」进来：分片清单存在任务里，不重新拉播放列表
+    var listP = resumeTask
+      ? Promise.resolve({
+          pl: {
+            segs: [],
+            map: resumeTask.map ? { uri: resumeTask.map.uri, range: resumeTask.map.range, key: null } : null,
+            endlist: resumeTask.endlist !== false, mediaSeq: 0, total: 0
+          }
+        })
+      : getPlaylist(it.url);
+
+    listP.then(function (c) {
+      if (resumeTask) {
+        tasks = resumeTask.segs;
+        pl = c.pl;
+        task = resumeTask;
+      } else {
+        pl = c.pl;
+        if (!pl.segs.length) throw new Error('播放列表为空');
+        var encErr = checkCryptoSupport(pl);
+        if (encErr) throw new Error(encErr);
+
+        if (pl.map) {
+          tasks.push({ url: pl.map.uri, range: pl.map.range, key: pl.map.key || null, seq: 0, isMap: true });
+        }
+        for (var i = 0; i < pl.segs.length; i++) {
+          if (pl.segs[i].gap) continue;   // 占位分片不下载（seq 仍按原始序号算）
+          tasks.push({
+            url: pl.segs[i].url,
+            range: pl.segs[i].range,
+            key: pl.segs[i].key,
+            seq: pl.mediaSeq + i
+          });
+        }
+
+        // 同 URL 有旧任务且分片逐位一致 → 复用已下部分；对不上（列表变了/直播）→ 作废重下
+        var old = findTask(it.url, 'hls');
+        if (old && old.endlist && segsMatch(old.segs, tasks)) {
+          task = old;
+        } else if (old) {
+          taskRemove(old.id);
+        }
+      }
+
+      // 点播 + OPFS 才记录断点；直播和内存兜底维持"结果攒内存"的老路
+      if (!task && partsDir && pl.endlist !== false) {
+        task = {
+          id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+          kind: 'hls', name: name, url: it.url, page: location.host, ts: Date.now(),
+          segs: tasks, done: tasks.map(function () { return 0; }),
+          map: pl.map ? { uri: pl.map.uri, range: pl.map.range } : null,
+          endlist: true
+        };
+        dlTasks.unshift(task);
+        taskFlush(true);
+      }
+
+      if (task) {
+        var had = 0;
+        for (var d = 0; d < task.done.length; d++) { if (task.done[d]) had++; }
+        doneCount = had;
+        if (had > 0) {
+          pg.progress(doneCount, tasks.length);
+          toast('继续上次：已完成 ' + had + '/' + tasks.length + ' 段');
+        }
+      }
+      results = new Array(tasks.length);
+
+      var next = 0;
+      function worker() {
+        if (next >= tasks.length) return Promise.resolve();
+        var idx = next++;
+        if (task && task.done[idx]) return worker();   // 已下过的跳过
+        return grab(tasks[idx], 0).then(function (buf) {
+          if (buf) streak = 0;
+          doneCount++;
+          var after = Promise.resolve();
+          if (task && buf) {
+            // 先落盘再标记：半路挂掉也不会有"标记了但文件没有"的洞
+            after = writePart(task.id, idx, buf).then(function () {
+              task.done[idx] = 1;
+              if (Date.now() - lastFlush > 3000) {
+                lastFlush = Date.now();
+                taskFlush();
+              }
+            }, function () { task = null; });   // 写盘失败：降级为内存模式继续下
+          } else if (buf) {
+            results[idx] = new Blob([buf]);
+          }
+          if (buf) gotBytes += buf.byteLength;
+          var now = Date.now();
+          if (now - lastPaint > 250) {
+            lastPaint = now;
+            pg.sub(fmtRate(rate(now, gotBytes)) + ' · 已 ' + fmtBytes(gotBytes));
+          }
+          pg.progress(doneCount, tasks.length);
+          return after.then(worker);
+        });
+      }
+
+      var ws = [];
+      var n = Math.min(THREADS, tasks.length);
+      for (var w = 0; w < n; w++) ws.push(worker());
+      return Promise.all(ws);
+    }).then(function () {
+      // 分片来源：续传模式从盘上读回；内存模式用 results
+      var srcP;
+      if (task) {
+        var fl = [];
+        for (var k = 0; k < tasks.length; k++) {
+          if (tasks[k].isMap || task.done[k]) {
+            fl.push(readPart(task.id, k).catch(function () { return null; }));
+          } else {
+            fl.push(Promise.resolve(null));
+          }
+        }
+        srcP = Promise.all(fl);
+      } else {
+        srcP = Promise.resolve(results);
+      }
+      return srcP.then(function (rs) {
+        var parts = rs.filter(function (x) { return x; });
+        var totalBytes = 0;
+        for (var i = 0; i < parts.length; i++) totalBytes += parts[i].size || 0;
+        var tail = (failed ? '，' + failed + ' 个分片失败' : '') + (pl.endlist ? '' : '，直播流仅当前片段');
+
+        function saveDl(blob, fname, msg) {
+          pg.close();
+          dlPut(blob, fname).then(function (ent) {
+            var fin = task ? taskRemove(task.id) : Promise.resolve();
+            return fin.then(function () {
+              dlActive--;
+              toast('已存入下载管理：' + ent.name + '（' + msg + '）');
+              renderDownloads();
+            });
+          }, function () {
+            dlActive--;
+            toast('写入下载管理失败，请重试');
+          });
+        }
+
+        if (pl.map) {
+          if (!rs[0]) throw new Error('init 段下载失败，无法合并 MP4');
+          return saveDl(new Blob(parts, { type: 'video/mp4' }), name + '.mp4', THREADS + ' 线程' + tail);
+        }
+
+        if (totalBytes > 300 * 1024 * 1024) {
+          return saveDl(new Blob(parts, { type: 'video/mp2t' }), name + '.ts', 'TS，VLC / MX 可播' + tail);
+        }
+
+        pg.set('正在转封装为 MP4…');
+        pg.sub('');
+        return remuxToMp4(parts, function (cur, total) { pg.progress(cur, total); }).then(function (blob) {
+          if (!blob || blob.size < totalBytes * 0.4) throw new Error('输出异常');
+          saveDl(blob, name + '.mp4', THREADS + ' 线程' + tail);
+        }).catch(function () {
+          saveDl(new Blob(parts, { type: 'video/mp2t' }), name + '.ts', 'TS，转封装不可用' + tail);
+        });
+      });
+    }).catch(function (err) {
+      try { ctrl.abort(); } catch (e) {}
+      dlActive--;
+      pg.close();
+      if (err && err.name === 'AbortError') {
+        if (task) { taskFlush(true); toast('已暂停，可在下载管理继续'); }
+        else toast('已取消下载');
+        renderDownloads();
+        return;
+      }
+      if (task) {
+        taskFlush(true);
+        toast('下载中断：进度已保存，可在下载管理继续');
+        renderDownloads();
+        return;
+      }
+      toast('下载失败：' + (err && err.message ? err.message : '未知') + '，可点“复制”用其他工具');
+    });
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  录制兜底（MSE 流抓不到地址时）
+   * ------------------------------------------------------------------ */
+  var recorder = null;
+  var recChunks = [];
+  var recName = '';
+
+  function startRecord() {
+    if (recorder && recorder.state === 'recording') {
+      recorder.stop();
+      return;
+    }
+    var v = null;
+    var vs = collectVideos(document);
+    for (var i = 0; i < vs.length; i++) {
+      if (!vs[i].paused && vs[i].videoWidth) { v = vs[i]; break; }
+    }
+    if (!v && vs.length) v = vs[0];
+    if (!v) { toast('没找到可录制的视频'); return; }
+    if (!v.captureStream) { toast('当前内核不支持录制'); return; }
+
+    try {
+      var stream = v.captureStream();
+      var mime = 'video/webm;codecs=vp8,opus';
+      if (!window.MediaRecorder || !MediaRecorder.isTypeSupported(mime)) mime = 'video/webm';
+      recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 4000000 });
+      recChunks = [];
+      recName = sanitize(document.title || 'video') + '.webm';
+      recorder.ondataavailable = function (e) { if (e.data && e.data.size) recChunks.push(e.data); };
+      recorder.onstop = function () {
+        var blob = new Blob(recChunks, { type: 'video/webm' });
+        dlPut(blob, recName, 'video/webm').then(function (ent) {
+          toast('录制已存入下载管理：' + ent.name);
+          renderDownloads();
+        }, function () { toast('录制保存失败'); });
+        recorder = null;
+        var btn = sheetEl && sheetEl.querySelector('[data-a="rec"]');
+        if (btn) btn.textContent = '录制当前画面';
+        closeSheet();
+      };
+      recorder.start(1000);
+      var recBtn = sheetEl && sheetEl.querySelector('[data-a="rec"]');
+      if (recBtn) recBtn.textContent = '停止录制';
+      toast('开始录制，再点一次结束（实时，别退出页面）');
+    } catch (e) {
+      if (e && e.name === 'SecurityError') toast('视频跨域受保护，内核禁止录制画面');
+      else toast('录制启动失败');
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  杂项
+   * ------------------------------------------------------------------ */
+  function copyText(text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () { toast('已复制'); }, fallback);
+        return;
+      }
+    } catch (e) {}
+    fallback();
+
+    function fallback() {
+      try {
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.cssText = 'position:fixed;opacity:0;left:-9999px;';
+        (document.body || document.documentElement).appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        ta.remove();
+        toast('已复制');
+      } catch (e) { toast('复制失败，请手动长按地址'); }
+    }
+  }
+
+  function startScanner() {
+    var ticks = 0;
+    function tick() {
+      if (document.hidden) { setTimeout(tick, 3000); return; }
+      ticks++;
+      scanDom();
+      if (ticks % 5 === 0) scanPerf();
+      var quiet = !hasVideoEl && !hasMse && items.size === 0;
+      idleTicks = quiet ? idleTicks + 1 : 0;
+      setTimeout(tick, idleTicks > 20 ? 4000 : 1500);
+    }
+    setTimeout(tick, 400);
+  }
+
+  function postToParent(it) {
+    try {
+      var msg = { __xbvk: 1, url: it.url, kind: it.kind, score: it.score };
+      if (it.kind === 'blob' && it.blob) { msg.blob = it.blob; msg.mime = it.mime; }
+      window.parent.postMessage(msg, '*');
+    } catch (e) {}
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  启动
+   * ------------------------------------------------------------------ */
+  function boot() {
+    loadCfg();
+    dlInit();   // 预热下载管理存储（读清单、申请持久化），打开面板时零等待
+    var _si = SPEEDS.indexOf(Number(cfg.speed));
+    if (_si >= 0) speedIdx = _si;
+    hookMedia();
+    hookObjectUrl();
+    hookXHR();
+    hookFetch();
+    watchPerf();
+
+    window.addEventListener('message', function (e) {
+      var d = e.data;
+      if (!d || d.__xbvk !== 1) return;
+      var fromChild = false;
+      try { fromChild = !!(e.source && e.source !== window && e.source.parent === window); } catch (err) {}
+      if (!fromChild) return;
+      if (d.blob) {
+        try {
+          var u = URL.createObjectURL(d.blob);
+          blobs.set(u, { kind: 'blob', blob: d.blob, mime: d.mime || '' });
+          while (blobs.size > 3) {
+            var oldU = blobs.keys().next().value;
+            blobs.delete(oldU);
+            try { URL.revokeObjectURL(oldU); } catch (e2) {}
+          }
+          addItem(u, 'blob', { from: 'frame', score: 90, blob: d.blob, mime: d.mime });
+        } catch (err) {}
+        return;
+      }
+      if (!d.url) return;
+      addItem(d.url, d.kind || null, { from: 'frame', score: d.score || 90 });
+    });
+
+    startScanner();
+    scanPerf();   // 只做一次全量兜底，之后靠 hook + 增量
+
+    try {
+      document.addEventListener('play', function (e) {
+        var v = e.target;
+        if (v && v.tagName === 'VIDEO') tryTakeover(v);
+      }, true);
+    } catch (e) {}
+
+    document.addEventListener('DOMContentLoaded', function () {
+      if (IS_TOP) scanDom();
+    });
+
+    window.addEventListener('load', function () {
+      if (IS_TOP) { scanDom(); scanPerf(); }
+    });
+  }
+
+  boot();
+})();

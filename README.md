@@ -21,6 +21,5 @@
 ## 仓库说明（给协作者 / AI）
 
 - 本仓库由 `E:\projects\x_browser` 工作区的 `publish.js` 自动推送（发布流程、网络策略、坑见该工作区 `AGENTS.md`）
-- [`xb-video-kit`](https://github.com/orange123eee/xb-video-kit) 仓库是**迁移期镜像**，内容与本仓库同步，用于把老版本用户的更新地址平滑迁移到本仓库，确认迁移完成后可停用
 - 各插件为自包含单文件；版本号在 `@version` 与代码内 `var VERSION` 两处，需同步修改
 - 已知限制：用户脚本无 webRequest 权限，拦不住 HTML 解析期写死的请求（只能拦动态 + 隐藏元素）；`@grant none` 下存储按站点隔离

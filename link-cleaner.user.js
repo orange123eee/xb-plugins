@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         链接净化 · 直达
 // @namespace    local.xbrowser.linkcleaner
-// @version      1.1.1
-// @description  去掉搜索结果/分享链接的中转跳转，点击直达目标地址；已知中转页（百度 link）自动秒跳，不等倒计时。零界面无感运行。
+// @version      1.2.0
+// @description  去掉搜索结果/分享链接的中转跳转，点击直达目标；清洗 utm/spm/fbclid 等追踪参数（含地址栏）；已知中转页（百度/搜狗/360 link）自动秒跳。零界面无感运行。
 // @author       me
 // @match        *://*/*
 // @run-at       document-start
@@ -118,22 +118,74 @@
     return V.href;
   }
 
-  // 链式中转最多解 3 层（a → redirect?url=b → b?url=c → c）
-  function extractTarget(href) {
-    var cur = href, hops = 0;
+  // 链式中转最多解 3 层（a → redirect?url=b → b?url=c → c），
+  // 末尾顺手洗掉目标地址上的追踪参数（ClearURLs 的"解中转+洗参数"组合）
+  function sanitizeHref(href) {
+    var cur = href, hops = 0, unwrapped = 0;
     while (hops++ < 3) {
       var next = oneHop(cur);
       if (!next) break;
       cur = next;
+      unwrapped++;
     }
-    return (cur !== href && /^https?:\/\//i.test(cur)) ? cur : null;
+    var cl = cleanTracking(cur);
+    if (cl) cur = cl.url;
+    if (cur !== href && /^https?:\/\//i.test(cur)) {
+      return { url: cur, unwrapped: unwrapped, params: cl ? cl.removed : 0 };
+    }
+    return null;
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  追踪参数清洗（ClearURLs 核心思路的保守子集）
+   *  只剥"纯追踪"参数；功能性参数（视频 id、搜索词、编码、时间戳、
+   *  网盘 share_id 等）一律不碰——宁可漏剥，不可弄坏链接
+   * ------------------------------------------------------------------ */
+
+  // 精确匹配名单（都是业界公认的广告点击 id / 分享埋点）
+  var TRACK_KEYS = {
+    fbclid: 1, gclid: 1, dclid: 1, msclkid: 1, twclid: 1, ttclid: 1, wbclid: 1,
+    igshid: 1, igsh: 1, si: 1, li_fat_id: 1,
+    ref_src: 1, ref_url: 1, unique_k: 1, isappinstalled: 1,
+    vd_source: 1, vd_style: 1, vd_webview: 1, vd_campaign: 1,
+    share_source: 1, share_medium: 1, share_plat: 1, share_tag: 1,
+    share_session_id: 1, share_to: 1
+  };
+  // 前缀匹配（utm_* 全家桶；阿里系/B站 spm 埋点含 spm_id_from 等变体）
+  var TRACK_PREFIX = ['utm_', 'spm'];
+
+  function isTrackKey(k) {
+    var s = String(k).toLowerCase();
+    if (TRACK_KEYS[s]) return true;
+    for (var i = 0; i < TRACK_PREFIX.length; i++) {
+      if (s.indexOf(TRACK_PREFIX[i]) === 0) return true;
+    }
+    return false;
+  }
+
+  // 返回 {url, removed} 或 null（无需清洗）
+  function cleanTracking(href) {
+    if (!href || href.charAt(0) === '#') return null;
+    try {
+      var u = new URL(href, location.href);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+      if (!u.search) return null;
+      var doomed = [];
+      u.searchParams.forEach(function (v, k) {
+        if (isTrackKey(k) && doomed.indexOf(k) < 0) doomed.push(k);
+      });
+      if (!doomed.length) return null;
+      for (var i = 0; i < doomed.length; i++) u.searchParams.delete(doomed[i]);
+      return { url: u.toString(), removed: doomed.length };
+    } catch (e) { return null; }
   }
 
   /* ------------------------------------------------------------------ *
    *  改写 + 增量监听
    * ------------------------------------------------------------------ */
 
-  var cleaned = 0;
+  var cleaned = 0;          // 解开的中转链接数
+  var paramsCleaned = 0;    // 剥掉的追踪参数数（含当前页地址栏）
   var toastShown = false;
 
   function cleanRoot(root) {
@@ -147,17 +199,18 @@
       a.__xlc = 1;
       a.__xlcHref = href0;
       if (!href0 || href0.charAt(0) === '#' || /^(javascript|mailto|tel):/i.test(href0)) continue;
-      var t = null;
-      try { t = extractTarget(href0); } catch (e) {}
-      if (t) {
+      var res = null;
+      try { res = sanitizeHref(href0); } catch (e) {}
+      if (res) {
         try {
-          a.setAttribute('href', t);
-          a.__xlcHref = t;
-          cleaned++;
+          a.setAttribute('href', res.url);
+          a.__xlcHref = res.url;
+          cleaned += res.unwrapped;
+          paramsCleaned += res.params;
         } catch (e) {}
       }
     }
-    if (cleaned > 0) setTimeout(maybeToast, 700);
+    if (cleaned > 0 || paramsCleaned > 0) setTimeout(maybeToast, 700);
   }
 
   // 点击兜底：批量清理赶不上的时候（插入后立即被点、SPA 改地址），
@@ -170,13 +223,13 @@
     if (!t || t === document || !t.getAttribute) return;
     var href = t.getAttribute('href');
     if (!href || href.charAt(0) === '#' || /^(javascript|mailto|tel):/i.test(href)) return;
-    var real = null;
-    try { real = extractTarget(href); } catch (err) {}
-    if (real && real !== href) {
+    var res = null;
+    try { res = sanitizeHref(href); } catch (err) {}
+    if (res && res.url !== href) {
       try {
-        t.setAttribute('href', real);
+        t.setAttribute('href', res.url);
         t.__xlc = 1;
-        t.__xlcHref = real;
+        t.__xlcHref = res.url;
       } catch (err) {}
     }
   }
@@ -192,10 +245,13 @@
 
   // 每页最多提示一次，1.5 秒消失，不打扰
   function maybeToast() {
-    if (toastShown || !cleaned || !document.body) return;
+    if (toastShown || (!cleaned && !paramsCleaned) || !document.body) return;
     toastShown = true;
+    var parts = [];
+    if (cleaned) parts.push(cleaned + ' 个跳转');
+    if (paramsCleaned) parts.push(paramsCleaned + ' 处追踪参数');
     var d = document.createElement('div');
-    d.textContent = '已清理 ' + cleaned + ' 个跳转链接';
+    d.textContent = '已清理 ' + parts.join('、');
     d.style.cssText = 'position:fixed;left:50%;bottom:72px;transform:translateX(-50%) translateY(8px);' +
       'background:rgba(17,19,23,.9);color:#e9ebef;padding:7px 12px;border-radius:9px;' +
       'font:12px/1.4 -apple-system,"PingFang SC","Noto Sans SC",sans-serif;z-index:2147483647;' +
@@ -241,14 +297,32 @@
     try { V = new URL(t); } catch (e) { return; }
     // 目标是自己 host 的不跳（防死循环）
     if (V.host === location.host) return;
-    location.replace(V.href);
+    // 目标地址上的追踪参数顺手洗掉再跳
+    var cl = null;
+    try { cl = cleanTracking(V.href); } catch (e) {}
+    location.replace(cl ? cl.url : V.href);
   }
 
   /* ------------------------------------------------------------------ *
    *  启动
    * ------------------------------------------------------------------ */
 
+  // 地址栏自清洗：当前页地址带着 utm/spm 之类进来的，replaceState 洗干净——
+  // 之后从浏览器菜单分享/复制的地址就是干净的。只动参数不动路径和 hash
+  function selfClean() {
+    if (!IS_TOP) return;
+    try {
+      var cl = cleanTracking(location.href);
+      if (cl && cl.removed) {
+        history.replaceState(history.state, '', cl.url);
+        paramsCleaned += cl.removed;
+        setTimeout(maybeToast, 900);
+      }
+    } catch (e) {}
+  }
+
   function start() {
+    try { selfClean(); } catch (e) {}
     try { cleanRoot(document.body); } catch (e) {}
     try { interstitialJump(); } catch (e) {}
     try {

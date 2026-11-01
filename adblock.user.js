@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         广告拦截 · AdBlock Lite
 // @namespace    local.xbrowser.adblock
-// @version      2.2.2
-// @description  拦截广告/追踪请求、popunder 弹窗与广告元素；广告库假加载骗过反拦截检测；通用"跳过广告"自动点；YouTube 接口级去广。内置精简规则，不订阅外部列表。
+// @version      2.3.0
+// @description  拦截广告/追踪请求、popunder 弹窗与广告元素；广告库假加载骗过反拦截检测；通用"跳过广告"自动点；YouTube 接口级去广。内置精简规则+自维护远程规则订阅（改规则不用发版）。
 // @author       me
 // @match        *://*/*
 // @run-at       document-start
@@ -20,7 +20,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '2.2.2';
+  var VERSION = '2.3.0';
   var HOST = location.hostname.toLowerCase();
 
   if (window.__xbAdblock) return;
@@ -114,6 +114,112 @@
       }).join('|') + ')', 'i');
     } catch (e) { HOST_HINT = null; }
   })();
+
+  /* ------------------------------------------------------------------ *
+   *  远程规则订阅：规则文件放在我们自己的仓库（GitHub Pages 带跨域头），
+   *  改规则不用发新版本脚本——诊断→改 rules.json→推仓库，用户端自动生效。
+   *  启动时同步应用 localStorage 缓存（不发网络请求），后台按 TTL 刷新缓存，
+   *  刷新结果下次打开页面生效（选择器需要重建样式表，不值得为此加复杂度）。
+   * ------------------------------------------------------------------ */
+  var RULES_LS = 'xbab.rules';
+  var RULES_URLS = [
+    'https://orange123eee.github.io/xb-plugins/rules.json',
+    'https://raw.githubusercontent.com/orange123eee/xb-plugins/main/rules.json'
+  ];
+  var RULES_TTL = 6 * 3600 * 1000;
+  var remoteRules = null;                     // 已应用的远程规则
+  var remoteApplied = { hosts: 0, links: 0, allow: 0, selectors: 0, t: 0 };
+
+  // 结构校验：形状不对/超量/含可疑字符一律整体拒绝（规则文件是我们自己的，防的是手滑）
+  function validateRules(d) {
+    if (!d || typeof d !== 'object') return null;
+    var out = { hosts: [], links: [], allow: [], selectors: [] };
+    var caps = { hosts: 2000, links: 500, allow: 200, selectors: 300 };
+    for (var key in out) {
+      var arr = d[key];
+      if (!arr) continue;
+      if (typeof arr.length !== 'number' || arr.length > caps[key]) return null;
+      for (var i = 0; i < arr.length; i++) {
+        var s = arr[i];
+        if (typeof s !== 'string') continue;
+        s = s.trim().toLowerCase();
+        if (s.length < 2 || s.length > 200) continue;
+        if (key === 'selectors') {
+          if (/[{};@]/.test(s)) continue;     // 防止 CSS 注入破坏样式表
+          out.selectors.push(s);
+        } else {
+          if (!/^[a-z0-9.-]+$/.test(s)) continue;
+          out[key].push(s);
+        }
+      }
+    }
+    out._v = (d._v != null) ? String(d._v).slice(0, 40) : '';
+    return out;
+  }
+
+  function applyRulesToMaps(d) {
+    if (!d) return;
+    var i;
+    for (i = 0; i < d.hosts.length; i++) if (!HOST_MAP[d.hosts[i]]) { HOST_MAP[d.hosts[i]] = 1; remoteApplied.hosts++; }
+    for (i = 0; i < d.links.length; i++) if (!LINK_MAP[d.links[i]]) { LINK_MAP[d.links[i]] = 1; remoteApplied.links++; }
+    for (i = 0; i < d.allow.length; i++) if (!ALLOW_MAP[d.allow[i]]) { ALLOW_MAP[d.allow[i]] = 1; remoteApplied.allow++; }
+  }
+
+  // 同步应用本地缓存（在 HOST_HINT 构建前调用，远程域名必须进预筛选正则）
+  (function () {
+    try {
+      var box = JSON.parse(localStorage.getItem(RULES_LS) || 'null');
+      if (!box || !box.d) return;
+      remoteRules = validateRules(box.d);
+      if (remoteRules) { applyRulesToMaps(remoteRules); remoteApplied.t = box.t || 0; }
+    } catch (e) { remoteRules = null; }
+  })();
+
+  // HOST_HINT 预筛选必须包含远程域名，否则 innerHTML 清洗会漏掉它们
+  (function () {
+    if (!remoteRules) return;
+    var extra = remoteRules.hosts.concat(remoteRules.links);
+    if (!extra.length) return;
+    try {
+      HOST_HINT = new RegExp('(' + BLOCK_HOSTS.concat(LINK_HOSTS, extra).map(function (d) {
+        return d.replace(/\./g, '\\.');
+      }).join('|') + ')', 'i');
+    } catch (e) {}
+  })();
+
+  // 强制拉取 = true 时无视 TTL；返回 {changed, data}
+  function fetchRules(force) {
+    var box = null;
+    try { box = JSON.parse(localStorage.getItem(RULES_LS) || 'null'); } catch (e) {}
+    if (!force && box && box.t && Date.now() - box.t < RULES_TTL) {
+      return Promise.resolve({ changed: false, stale: true });
+    }
+    function attempt(i) {
+      if (i >= RULES_URLS.length) return Promise.reject(new Error('规则源都不可达'));
+      var ctrl = new AbortController();
+      var timer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, 8000);
+      return fetch(RULES_URLS[i] + (RULES_URLS[i].indexOf('?') < 0 ? '?' : '&') + 't=' + Date.now(),
+        { signal: ctrl.signal, credentials: 'omit' }).then(function (r) {
+          clearTimeout(timer);
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.text();
+        }).then(function (txt) {
+          var d = validateRules(JSON.parse(txt));
+          if (!d) throw new Error('规则文件格式无效');
+          return d;
+        }).catch(function (e) {
+          clearTimeout(timer);
+          return attempt(i + 1);
+        });
+    }
+    return attempt(0).then(function (d) {
+      var old = '';
+      try { old = JSON.stringify(box && box.d ? validateRules(box.d) || {} : {}); } catch (e) {}
+      var changed = JSON.stringify(d) !== old;
+      try { localStorage.setItem(RULES_LS, JSON.stringify({ t: Date.now(), d: d })); } catch (e) {}
+      return { changed: changed, data: d };
+    });
+  }
 
   // 精简版公共后缀表：只用于区分"同站/CDN"和第三方，完整表见 publicsuffix.org
   var MULTI_SUFFIX = Object.create(null);
@@ -683,6 +789,17 @@
     'div:has(> iframe[src*="myavlive.com"])'
   ] : [];
 
+  // 远程规则的元素隐藏选择器合并进静态表（在样式文本构建前）
+  (function () {
+    if (!remoteRules || !remoteRules.selectors.length) return;
+    for (var i = 0; i < remoteRules.selectors.length; i++) {
+      if (AD_SELECTORS.indexOf(remoteRules.selectors[i]) < 0) {
+        AD_SELECTORS.push(remoteRules.selectors[i]);
+        remoteApplied.selectors++;
+      }
+    }
+  })();
+
   var AD_SEL = AD_SELECTORS.join(',');
   var CSS_TEXT = AD_SEL + '{display:none !important}';
   if (AD_HAS_SELECTORS.length) {
@@ -1180,9 +1297,16 @@
 
   function diagText() {
     var list = collectHosts();
+    var rl = '(未加载)';
+    if (remoteRules) {
+      var n = remoteApplied.hosts + remoteApplied.links + remoteApplied.allow + remoteApplied.selectors;
+      var age = remoteApplied.t ? Math.round((Date.now() - remoteApplied.t) / 3600000) + ' 小时前' : '';
+      rl = '+' + n + ' 条' + (remoteRules._v ? ' (v' + remoteRules._v + ')' : '') + (age ? '，更新于' + age : '');
+    }
     var lines = ['# 广告拦截诊断 v' + VERSION, '页面: ' + location.href,
       '拦截: 请求 ' + stat.req + ' · 元素 ' + stat.el + ' · 弹窗 ' + stat.pop +
-      ' · 视频 ' + stat.yt + ' · 跳过 ' + stat.skip + ' · YouTube接口 ' + stat.ytapi, '', '外部域名:'];
+      ' · 视频 ' + stat.yt + ' · 跳过 ' + stat.skip + ' · YouTube接口 ' + stat.ytapi,
+      '远程规则: ' + rl, '', '外部域名:'];
     for (var i = 0; i < list.length; i++) {
       var cls = classify('https://' + list[i][0] + '/', 'other');
       lines.push((cls ? '[已拦:' + cls + '] ' : '[未拦] ') + list[i][0] + ' x' + list[i][1]);
@@ -1240,13 +1364,25 @@
     }
 
     var copyBtn = mkBtn('复制诊断', false);
+    var rBtn = mkBtn('更新规则', false);
     var offBtn = mkBtn('本站关闭', false);
     var okBtn = mkBtn('关闭', true);
 
     row.appendChild(copyBtn);
+    row.appendChild(rBtn);
     row.appendChild(offBtn);
     row.appendChild(okBtn);
     card.appendChild(row);
+
+    rBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      rBtn.textContent = '刷新中…';
+      fetchRules(true).then(function (res) {
+        rBtn.textContent = res.changed ? '已更新✓ 刷新页面生效' : '无更新';
+      }, function () {
+        rBtn.textContent = '更新失败';
+      });
+    });
     root.insertBefore(card, badgeEl.pill);
 
     copyBtn.addEventListener('click', function (e) {
@@ -1343,6 +1479,11 @@
 
   // 徽标上的数字保持最新
   badgeTick = setInterval(refreshBadge, 1200);
+
+  // 远程规则后台刷新：只更新缓存（下次打开页面生效），失败静默
+  if (IS_TOP) {
+    try { fetchRules(false).catch(function () {}); } catch (e) {}
+  }
 
   window.__ab.enableLog = function (on) { window.__abLog = !!on; };
   window.__ab.sweep = sweep;

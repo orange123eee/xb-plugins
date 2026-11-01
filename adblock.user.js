@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         广告拦截 · AdBlock Lite
 // @namespace    local.xbrowser.adblock
-// @version      2.3.0
+// @version      2.3.1
 // @description  拦截广告/追踪请求、popunder 弹窗与广告元素；广告库假加载骗过反拦截检测；通用"跳过广告"自动点；YouTube 接口级去广。内置精简规则+自维护远程规则订阅（改规则不用发版）。
 // @author       me
 // @match        *://*/*

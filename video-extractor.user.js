@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频提取器 · 万能播放/下载
 // @namespace    local.xbrowser.videokit
-// @version      3.2.0
+// @version      3.3.0
 // @description  自动嗅探网页视频（直链 / m3u8 / MSE 流），自带播放器（倍速、清晰度切换、全片拖动）与站内下载管理（不跳系统下载器，可打开/分享/导出），多线程下载并合并为 mp4。
 // @author       me
 // @match        *://*/*
@@ -22,7 +22,7 @@
   try { IS_TOP = (window.top === window.self); } catch (e) { IS_TOP = false; }
 
   var MAX_ITEMS = 40;
-  var VERSION = '3.2.0';
+  var VERSION = '3.3.0';
 
   var CFG_KEY = 'xbvk.cfg';
   var cfg = {
@@ -31,7 +31,8 @@
     gestures: true,       // 画面手势（拖动/双击/长按/音量亮度）
     skipIntro: 0,         // 跳过片头秒数
     speed: 1,             // 默认倍速
-    segCache: true        // 边看边缓存（关掉就完全不占内存）
+    segCache: true,       // 边看边缓存（关掉就完全不占内存）
+    autoExport: true      // 下载完成自动弹系统分享/保存（视频才能进相册，插件存储只是中转）
   };
   function loadCfg() {
     try {
@@ -876,6 +877,7 @@
     '.srow:last-child{border-bottom:0}',
     '.srow.col{flex-direction:column;align-items:stretch;gap:10px}',
     '.srow.col>span{color:#aeb6c2;font-size:12.5px}',
+    '.srow .shint{font-style:normal;color:#8b93a1;font-size:11.5px;line-height:1.5}',
     '.sw{width:44px;height:26px;border-radius:13px;background:rgba(255,255,255,.16);position:relative;flex:none;transition:background .2s}',
     '.sw::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;transition:left .2s}',
     '.sw.on{background:#fb7299}',
@@ -994,6 +996,9 @@
       '<div class="srow col"><span>默认倍速</span><div class="seg" data-k="speed">' +
       '<button data-v="1">1.0x</button><button data-v="1.25">1.25x</button><button data-v="1.5">1.5x</button><button data-v="2">2.0x</button>' +
       '</div></div>' +
+      '<div class="sgrp">下 载</div>' +
+      '<div class="srow"><span>下载完自动弹出保存/分享</span><b class="sw" data-k="autoExport"></b></div>' +
+      '<div class="srow col"><i class="shint">开了它，每次下载完弹系统分享面板，选「保存到相册/设备」即可；关掉则只存插件内，需到下载页签手动导出</i></div>' +
       '<div class="sgrp">缓 存</div>' +
       '<div class="srow"><span>边看边缓存</span><b class="sw" data-k="segCache"></b></div>' +
       '<div class="srow"><span>缓存占用</span><div class="cwrap"><i class="csz">0 MB</i>' +
@@ -3097,21 +3102,42 @@
 
   function playTsBuffer(buf) {
     var mime = pickMime(false);
-    if (!mime) { toast('内核不支持 TS 播放，请先下载'); return; }
-    var ms = new MediaSource();
-    var objUrl = URL.createObjectURL(ms);
-    dlObjUrls.push(objUrl);
-    videoEl.src = objUrl;
-    ms.addEventListener('sourceopen', function () {
-      var sb;
-      try { sb = ms.addSourceBuffer(mime); } catch (e) { toast('TS 播放失败'); return; }
-      appendTo(sb, buf).then(function () {
-        try { ms.endOfStream(); } catch (e) {}
-        safePlay(videoEl);
-      }).catch(function () {
-        toast('TS 播放失败');
-      });
-    }, { once: true });
+    if (mime) {
+      var ms = new MediaSource();
+      var objUrl = URL.createObjectURL(ms);
+      dlObjUrls.push(objUrl);
+      videoEl.src = objUrl;
+      ms.addEventListener('sourceopen', function () {
+        var sb;
+        try { sb = ms.addSourceBuffer(mime); } catch (e) { playTsViaRemux(buf); return; }
+        appendTo(sb, buf).then(function () {
+          try { ms.endOfStream(); } catch (e) {}
+          safePlay(videoEl);
+        }).catch(function () {
+          playTsViaRemux(buf);
+        });
+      }, { once: true });
+      return;
+    }
+    playTsViaRemux(buf);
+  }
+
+  // 内核不支持 mp2t（或拒收）时的兜底：mux.js 转封装成 fMP4 再喂 MSE。
+  // 之前只报「TS 播放失败」，用户手里明明有完好的数据却看不了。
+  function playTsViaRemux(buf) {
+    if (!window.MediaSource || !pickMime(true)) {
+      toast('内核不支持播放 TS，请点「保存 / 分享」用系统播放器打开');
+      return;
+    }
+    toast('正在转换格式…');
+    remuxToMp4([buf], null).then(function (mp4) {
+      var objUrl = URL.createObjectURL(mp4);
+      dlObjUrls.push(objUrl);
+      videoEl.src = objUrl;
+      safePlay(videoEl);
+    }, function () {
+      toast('TS 播放失败，请点「保存 / 分享」用系统播放器打开');
+    });
   }
 
   /* ------------------------------------------------------------------ *
@@ -4402,7 +4428,7 @@
     try { a.click(); ok = true; } catch (e) {}
     setTimeout(function () { try { a.remove(); } catch (e) {} }, 8000);
     setTimeout(function () { try { URL.revokeObjectURL(url); } catch (e) {} }, 600000);
-    if (ok) toast('已导出：' + name + '（没反应就长按链接另存）');
+    if (ok) toast('已导出：' + name + '（视频类建议在下载管理里用「保存 / 分享」走系统分享，更可靠）');
     else toast('导出没成功，请长按链接另存');
   }
 
@@ -4418,6 +4444,17 @@
       });
     }
     exportBlob(blob, name);
+  }
+
+  // 下载完成自动导出：把成品从插件存储交到系统手里（分享面板选「相册/保存到设备」才真正进相册）。
+  // 插件自己的 OPFS 存储按站点隔离，用户在文件管理器里永远看不见——只当中转，不当终点。
+  function autoExportDl(entry) {
+    if (!cfg.autoExport || !entry) return;
+    var kind = dlKindOf(entry.name, entry.mime);
+    if (kind !== 'video' && kind !== 'img') return;   // txt/json 这类自动弹面板纯属打扰
+    dlGetBlob(entry).then(function (b) {
+      return shareFile(b, entry.name, entry.mime);
+    }).catch(function () {});   // 导出失败不打断主流程，文件仍在下载管理里可手动导出
   }
 
   function anchorDownload(url, name) {
@@ -4443,6 +4480,7 @@
       dlPut(it.blob, name + extOf(it), it.mime).then(function (ent) {
         toast('已存入下载管理：' + ent.name);
         renderDownloads();
+        autoExportDl(ent);
       }, function () { toast('保存失败，请重试'); });
       return;
     }
@@ -4559,6 +4597,7 @@
         return fin.then(function () {
           toast('已存入下载管理：' + ent.name);
           renderDownloads();
+          autoExportDl(ent);
         });
       }, function (err) {
         dlActive--;
@@ -4599,26 +4638,38 @@
     return '.mp4';
   }
 
-  var MUX_CDN = 'https://cdn.jsdelivr.net/npm/mux.js@7.0.3/dist/mux.min.js';
+  // jsDelivr 主站在国内直连经常失败：mux.js 加载失败会导致所有 HLS 下载都静默回退成 .ts
+  // （播放、导出全废）。改成多源依次尝试，全挂才认输。
+  var MUX_CDNS = [
+    'https://cdn.jsdelivr.net/npm/mux.js@7.0.3/dist/mux.min.js',
+    'https://fastly.jsdelivr.net/npm/mux.js@7.0.3/dist/mux.min.js',
+    'https://unpkg.com/mux.js@7.0.3/dist/mux.min.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/mux.js/7.0.3/mux.min.js',
+    'https://registry.npmmirror.com/mux.js/7.0.3/files/dist/mux.min.js'
+  ];
   var muxPromise = null;
 
   function loadMux() {
     if (window.muxjs) return Promise.resolve(window.muxjs);
     if (muxPromise) return muxPromise;
-    muxPromise = new Promise(function (res, rej) {
-      var done = false;
-      var s = document.createElement('script');
-      s.src = MUX_CDN;
-      s.onload = function () {
-        if (done) return;
-        done = true;
-        if (window.muxjs) res(window.muxjs);
-        else rej(new Error('mux.js 不可用'));
-      };
-      s.onerror = function () { if (done) return; done = true; rej(new Error('mux.js 加载失败')); };
-      (document.head || document.documentElement).appendChild(s);
-      setTimeout(function () { if (!done) { done = true; rej(new Error('mux.js 加载超时')); } }, 8000);
-    });
+    function tryOne(i) {
+      if (i >= MUX_CDNS.length) return Promise.reject(new Error('mux.js 所有源都加载失败'));
+      return new Promise(function (res, rej) {
+        var done = false;
+        var s = document.createElement('script');
+        s.src = MUX_CDNS[i];
+        s.onload = function () {
+          if (done) return;
+          done = true;
+          if (window.muxjs) res(window.muxjs);
+          else rej(new Error('mux.js 不可用'));
+        };
+        s.onerror = function () { if (done) return; done = true; rej(new Error('mux.js 加载失败')); };
+        (document.head || document.documentElement).appendChild(s);
+        setTimeout(function () { if (!done) { done = true; rej(new Error('mux.js 加载超时')); } }, 6000);
+      }).catch(function () { return tryOne(i + 1); });
+    }
+    muxPromise = tryOne(0);
     muxPromise.catch(function () { muxPromise = null; });
     return muxPromise;
   }
@@ -4846,6 +4897,7 @@
               dlActive--;
               toast('已存入下载管理：' + ent.name + '（' + msg + '）');
               renderDownloads();
+              autoExportDl(ent);
             });
           }, function () {
             dlActive--;

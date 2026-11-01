@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频提取器 · 万能播放/下载
 // @namespace    local.xbrowser.videokit
-// @version      3.3.0
+// @version      3.3.1
 // @description  自动嗅探网页视频（直链 / m3u8 / MSE 流），自带播放器（倍速、清晰度切换、全片拖动）与站内下载管理（不跳系统下载器，可打开/分享/导出），多线程下载并合并为 mp4。
 // @author       me
 // @match        *://*/*
@@ -22,7 +22,7 @@
   try { IS_TOP = (window.top === window.self); } catch (e) { IS_TOP = false; }
 
   var MAX_ITEMS = 40;
-  var VERSION = '3.3.0';
+  var VERSION = '3.3.1';
 
   var CFG_KEY = 'xbvk.cfg';
   var cfg = {
@@ -851,6 +851,9 @@
     'border:1px solid rgba(255,255,255,.08);backdrop-filter:blur(14px);',
     'opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;z-index:20;box-shadow:0 10px 34px rgba(0,0,0,.55)}',
     '.toast.on{opacity:1;transform:translate(-50%,0)}',
+    '.toast .tact{flex:none;margin-left:10px;padding:6px 13px;border:0;border-radius:8px;',
+    'background:linear-gradient(135deg,#ff8cab,#fb7299);color:#fff;font:600 12.5px/1 -apple-system,sans-serif}',
+    '.toast .tact:active{filter:brightness(1.12)}',
     '.pg{position:fixed;left:16px;right:16px;bottom:150px;background:rgba(20,22,27,.9);border-radius:13px;padding:12px 14px;',
     'z-index:21;color:#e9ebef;font:12.5px/1.4 -apple-system,sans-serif;display:none;',
     'border:1px solid rgba(255,255,255,.07);backdrop-filter:blur(14px);box-shadow:0 8px 28px rgba(0,0,0,.55)}',
@@ -2633,7 +2636,7 @@
     var ext = ((/\.[a-z0-9]{1,5}$/i.exec(f.name) || [''])[0]).toLowerCase();
     if (ext === '.ts') {
       openPlayer(f.name, null);
-      playTsBuffer(blob);
+      playTsBuffer(blob, f.name);
       return;
     }
     var objUrl = URL.createObjectURL(blob);
@@ -2700,13 +2703,28 @@
   }
 
   var toastTimer = null;
-  function toast(msg) {
+  // action 可选：{label, fn} —— 带"可点击动作"的 toast（如下载完的「保存到相册」）。
+  // navigator.share 必须由用户手势触发，下载完成时手势早已过期，
+  // 所以"自动弹出分享面板"做不到；退而求其次给一个一键按钮，点的那一下就是合法手势
+  function toast(msg, action) {
     buildUI();
     if (!toastEl) return;
-    toastEl.textContent = msg;
+    toastEl.textContent = '';
+    toastEl.appendChild(document.createTextNode(msg));
+    if (action && action.label && typeof action.fn === 'function') {
+      var b = document.createElement('button');
+      b.className = 'tact';
+      b.textContent = action.label;
+      b.addEventListener('click', function () {
+        clearTimeout(toastTimer);
+        toastEl.classList.remove('on');
+        try { action.fn(); } catch (e) {}
+      });
+      toastEl.appendChild(b);
+    }
     toastEl.classList.add('on');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(function () { toastEl.classList.remove('on'); }, 2600);
+    toastTimer = setTimeout(function () { toastEl.classList.remove('on'); }, action ? 8000 : 2600);
   }
 
   var lastErrMsg = '', lastErrAt = 0;
@@ -3100,7 +3118,7 @@
     });
   }
 
-  function playTsBuffer(buf) {
+  function playTsBuffer(buf, name) {
     var mime = pickMime(false);
     if (mime) {
       var ms = new MediaSource();
@@ -3109,24 +3127,33 @@
       videoEl.src = objUrl;
       ms.addEventListener('sourceopen', function () {
         var sb;
-        try { sb = ms.addSourceBuffer(mime); } catch (e) { playTsViaRemux(buf); return; }
+        try { sb = ms.addSourceBuffer(mime); } catch (e) { playTsViaRemux(buf, name); return; }
         appendTo(sb, buf).then(function () {
           try { ms.endOfStream(); } catch (e) {}
           safePlay(videoEl);
         }).catch(function () {
-          playTsViaRemux(buf);
+          playTsViaRemux(buf, name);
         });
       }, { once: true });
       return;
     }
-    playTsViaRemux(buf);
+    playTsViaRemux(buf, name);
   }
 
   // 内核不支持 mp2t（或拒收）时的兜底：mux.js 转封装成 fMP4 再喂 MSE。
   // 之前只报「TS 播放失败」，用户手里明明有完好的数据却看不了。
-  function playTsViaRemux(buf) {
+  function playTsViaRemux(buf, name) {
     if (!window.MediaSource || !pickMime(true)) {
       toast('内核不支持播放 TS，请点「保存 / 分享」用系统播放器打开');
+      return;
+    }
+    // 与下载路径同一条内存红线：整文件转封装要占 2~3 倍内存，
+    // 大文件直接转会把页面撑死（手机上尤其致命），交给系统播放器才是正路
+    if (buf.byteLength > 300 * 1024 * 1024) {
+      toast('文件较大（' + fmtBytes(buf.byteLength) + '），直接转换会卡死页面', {
+        label: '保存 / 分享',
+        fn: function () { shareFile(new Blob([buf], { type: 'video/mp2t' }), name || 'video.ts', 'video/mp2t'); }
+      });
       return;
     }
     toast('正在转换格式…');
@@ -4448,13 +4475,22 @@
 
   // 下载完成自动导出：把成品从插件存储交到系统手里（分享面板选「相册/保存到设备」才真正进相册）。
   // 插件自己的 OPFS 存储按站点隔离，用户在文件管理器里永远看不见——只当中转，不当终点。
+  // 返回是否接管了完成提示（接管时完成点不要再出普通 toast，避免覆盖带按钮的那条）。
+  // navigator.share 必须由点击触发（transient activation），下载完成时早已没有手势，
+  // 所以不能"全自动弹面板"——给完成 toast 挂一个「保存到相册」按钮，点的那一下就是合法手势
   function autoExportDl(entry) {
-    if (!cfg.autoExport || !entry) return;
+    if (!cfg.autoExport || !entry) return false;
     var kind = dlKindOf(entry.name, entry.mime);
-    if (kind !== 'video' && kind !== 'img') return;   // txt/json 这类自动弹面板纯属打扰
-    dlGetBlob(entry).then(function (b) {
-      return shareFile(b, entry.name, entry.mime);
-    }).catch(function () {});   // 导出失败不打断主流程，文件仍在下载管理里可手动导出
+    if (kind !== 'video' && kind !== 'img') return false;   // txt/json 这类弹面板纯属打扰
+    toast(entry.name + ' 已存入下载管理', {
+      label: kind === 'img' ? '保存 / 分享' : '保存到相册',
+      fn: function () {
+        dlGetBlob(entry).then(function (b) {
+          shareFile(b, entry.name, entry.mime);
+        }, function () { toast('文件读取失败，可在下载页签重试'); });
+      }
+    });
+    return true;
   }
 
   function anchorDownload(url, name) {
@@ -4478,9 +4514,8 @@
 
     if (it.blob) {
       dlPut(it.blob, name + extOf(it), it.mime).then(function (ent) {
-        toast('已存入下载管理：' + ent.name);
         renderDownloads();
-        autoExportDl(ent);
+        if (!autoExportDl(ent)) toast('已存入下载管理：' + ent.name);
       }, function () { toast('保存失败，请重试'); });
       return;
     }
@@ -4595,9 +4630,8 @@
         pg.close();
         var fin = (task && partsDir) ? taskRemove(task.id, true) : Promise.resolve();
         return fin.then(function () {
-          toast('已存入下载管理：' + ent.name);
           renderDownloads();
-          autoExportDl(ent);
+          if (!autoExportDl(ent)) toast('已存入下载管理：' + ent.name);
         });
       }, function (err) {
         dlActive--;
@@ -4895,9 +4929,8 @@
             var fin = task ? taskRemove(task.id) : Promise.resolve();
             return fin.then(function () {
               dlActive--;
-              toast('已存入下载管理：' + ent.name + '（' + msg + '）');
               renderDownloads();
-              autoExportDl(ent);
+              if (!autoExportDl(ent)) toast('已存入下载管理：' + ent.name + '（' + msg + '）');
             });
           }, function () {
             dlActive--;
@@ -4975,8 +5008,8 @@
       recorder.onstop = function () {
         var blob = new Blob(recChunks, { type: 'video/webm' });
         dlPut(blob, recName, 'video/webm').then(function (ent) {
-          toast('录制已存入下载管理：' + ent.name);
           renderDownloads();
+          if (!autoExportDl(ent)) toast('录制已存入下载管理：' + ent.name);
         }, function () { toast('录制保存失败'); });
         recorder = null;
         var btn = sheetEl && sheetEl.querySelector('[data-a="rec"]');

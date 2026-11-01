@@ -20,8 +20,10 @@
 (function () {
   'use strict';
 
-  var VERSION = '2.3.0';
+  var VERSION = '2.3.1';
   var HOST = location.hostname.toLowerCase();
+  var IS_TOP = true;
+  try { IS_TOP = (window.top === window.self); } catch (e) { IS_TOP = false; }
 
   if (window.__xbAdblock) return;
   window.__xbAdblock = VERSION;

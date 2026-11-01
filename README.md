@@ -10,6 +10,7 @@
 |---|---|---|
 | 视频提取器 · 万能播放/下载 | 自动嗅探网页视频（直链 / m3u8 / MSE 流）；内置播放器（手势拖动、倍速、清晰度切换、续播、B站式点按交互）；**站内下载管理**（下载不跳出浏览器，OPFS 持久存储，断点续传，完成后一键「保存到相册」，可直接播放、txt/图片预览） | [安装 / 更新](https://orange123eee.github.io/xb-plugins/video-extractor.user.js) |
 | 广告拦截 · AdBlock Lite | 广告/追踪域名 + 第三方路径 + 第一方广告脚本三层拦截；popunder 弹窗拦截；广告库假加载骗过「关拦截器才给看」的反拦截检测；通用播放器「跳过广告」自动点；YouTube 接口级去广；**远程规则订阅**（改规则不用发版）；徽标面板（统计 / 复制诊断 / 更新规则 / 本站关闭） | [安装 / 更新](https://orange123eee.github.io/xb-plugins/adblock.user.js) |
+| 阅读增强 · 畅读 | 小说/长文自动下一章无缝合并（免翻页）、正文净化、字号行距主题调节、进度记忆；检测到长文时右侧出现「畅读」页签 | [安装 / 更新](https://orange123eee.github.io/xb-plugins/reader.user.js) |
 | 链接净化 · 直达 | 去掉搜索结果 / 分享链接的中转跳转，点击直达；百度 / 搜狗 / 360 中转页自动秒跳；**清洗 utm/spm/fbclid 等追踪参数**（含地址栏，分享出去的链接干净） | [安装 / 更新](https://orange123eee.github.io/xb-plugins/link-cleaner.user.js) |
 
 （版本号以安装页实时显示为准，此处不硬编码）

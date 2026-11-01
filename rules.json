@@ -1,0 +1,8 @@
+{
+  "_v": "1",
+  "_note": "AdBlock Lite 远程规则表。hosts=广告/追踪域名；links=导流链接域名；allow=白名单（误杀救回）；selectors=元素隐藏选择器（不可含 {} ; @）。改完跑 node publish.js 推送，用户端 6 小时内自动生效（面板「更新规则」可立即拉取，刷新页面生效）。",
+  "hosts": [],
+  "links": [],
+  "allow": [],
+  "selectors": []
+}

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频提取器 · 万能播放/下载
 // @namespace    local.xbrowser.videokit
-// @version      3.3.1
+// @version      3.3.2
 // @description  自动嗅探网页视频（直链 / m3u8 / MSE 流），自带播放器（倍速、清晰度切换、全片拖动）与站内下载管理（不跳系统下载器，可打开/分享/导出），多线程下载并合并为 mp4。
 // @author       me
 // @match        *://*/*
@@ -22,7 +22,7 @@
   try { IS_TOP = (window.top === window.self); } catch (e) { IS_TOP = false; }
 
   var MAX_ITEMS = 40;
-  var VERSION = '3.3.1';
+  var VERSION = '3.3.2';
 
   var CFG_KEY = 'xbvk.cfg';
   var cfg = {
@@ -66,14 +66,16 @@
   function netFetch(url, init) {
     if (!rawFetch) return Promise.reject(new Error('内核不支持 fetch'));
     try {
-      selfReqs.add(String(url));
-      if (selfReqs.size > 500) selfReqs.delete(selfReqs.keys().next().value);   // 有界，别无限涨
+      var sk = absolutize(url);
+      selfReqs.delete(sk);                 // LRU：重复请求刷新顺序
+      selfReqs.add(sk);
+      if (selfReqs.size > 500) selfReqs.delete(selfReqs.keys().next().value);
     } catch (e) {}
     return rawFetch(url, init);
   }
 
-  var NET_RE = /\.(mp4|m4v|webm|mkv|mov|flv|m3u8|mpd)(?:[?#]|$)/i;
-  var SRC_RE = /\.(mp4|m4v|webm|mkv|mov|flv|m3u8|mpd|ts|m4s|ogv)(?:[?#]|$)/i;
+  var NET_RE = /\.(mp4|m4v|webm|mkv|mov|flv|m3u8|mpd)(?:[?#;/]|$)/i;
+  var SRC_RE = /\.(mp4|m4v|webm|mkv|mov|flv|m3u8|mpd|ts|m4s|ogv)(?:[?#;/]|$)/i;
   var MIME_RE = /^(video\/(mp4|webm|quicktime|x-matroska|x-flv)|application\/(vnd\.apple\.mpegurl|x-mpegurl|dash\+xml))/i;
 
   var items = new Map();   // url -> item
@@ -105,6 +107,11 @@
   var siteVideo = null;        // 被接管的网页播放器
   var siteWasPlaying = false;  // 接管前它是不是在播，退出接管要还原
   var takeoverTried = false;
+  var takeoverUrl = '';
+  var takeoverSrc = '';
+  var takeoverAt = 0;
+  var pStateChecks = 0;
+  var quotaWarned = false;
   var playerHiddenForSheet = false;   // 从播放器打开列表时先把播放器藏起来，收起列表要放回去
   var deepScanTick = 0;
   var speedIdx = 2;
@@ -235,9 +242,14 @@
             var abs = absolutize(u);
             addItem(abs, kind, { from: 'net', size: size, mime: type, score: kind ? 55 : 50 });
 
-            if (kind === 'hls' || /\.m3u8(?:[?#]|$)/i.test(u)) {
+            if (kind === 'hls' || /\.m3u8(?:[?#;/]|$)/i.test(u)) {
               try {
-                if (!xhr.responseType || xhr.responseType === 'text') seedText(abs, xhr.responseText);
+                if (xhr.responseType === 'arraybuffer' && xhr.response) {
+                  var txt = new TextDecoder('utf-8').decode(new Uint8Array(xhr.response));
+                  if (txt.indexOf('#EXTM3U') >= 0) seedText(abs, txt);
+                } else if (!xhr.responseType || xhr.responseType === 'text') {
+                  seedText(abs, xhr.responseText);
+                }
               } catch (e) {}
             }
           } catch (e) {}
@@ -260,7 +272,9 @@
       var p = orig.apply(this, arguments);
       try {
         if (url) {
-          if (NET_RE.test(url)) addItem(absolutize(url), null, { from: 'net', score: 50 });
+          var abs0 = absolutize(url);
+          var hadItem = items.has(abs0);
+          var ghost = NET_RE.test(url) ? addItem(abs0, null, { from: 'net', score: 50 }) : null;
 
           p.then(function (r) {
             try {
@@ -272,14 +286,21 @@
 
               var size = parseInt(r.headers.get('content-length') || '0', 10) || 0;
               var kind = kindFromMime(type);
-              var abs = absolutize(url);
-              addItem(abs, kind, { from: 'net', size: size, mime: type, score: kind ? 55 : 50 });
+              addItem(abs0, kind, { from: 'net', size: size, mime: type, score: kind ? 55 : 50, mimeOnly: !byUrl });
 
-              if (kind === 'hls' || /\.m3u8(?:[?#]|$)/i.test(url)) {
-                r.clone().text().then(function (t) { seedText(abs, t); }, function () {});
+              if (kind === 'hls' || /\.m3u8(?:[?#;/]|$)/i.test(url)) {
+                r.clone().text().then(function (t) { seedText(abs0, t); }, function () {});
               }
             } catch (e) {}
-          }, function () {});
+          }, function () {
+            // 请求失败：清掉刚建的幽灵条目，别触发预取/自动接管
+            if (ghost && !hadItem && items.get(abs0) === ghost && ghost.score <= 50) {
+              items.delete(abs0);
+              listDirty = true;
+              if (sheetOpen) scheduleRender();
+              ensureFab();
+            }
+          });
         }
       } catch (e) {}
       return p;
@@ -293,13 +314,13 @@
     return null;
   }
 
-  var ctItemCount = 0;
   function allowByMime(type, byUrl) {
     if (byUrl) return true;
     if (/mpegurl|dash\+xml/i.test(type)) return true;
-    if (ctItemCount >= 10) return false;
-    ctItemCount++;
-    return true;
+    // 配额按「当前列表里 MIME-only 条目数」算，随淘汰自动回收
+    var n = 0;
+    items.forEach(function (v) { if (v.mimeOnly) n++; });
+    return n < 10;
   }
 
   function scanPerf() {
@@ -323,6 +344,11 @@
 
   function watchPerf() {
     try {
+      if (performance && performance.addEventListener) {
+        performance.addEventListener('resourcetimingbufferfull', function () {
+          try { performance.clearResourceTimings(); perfIndex = 0; } catch (e) {}
+        });
+      }
       if (!window.PerformanceObserver) return;
       var po = new PerformanceObserver(function (l) {
         var es = l.getEntries();
@@ -357,14 +383,15 @@
       return;
     }
 
-    if (!/^https?:/i.test(absolutize(v))) return;
-    if (!SRC_RE.test(v) && !/^https?:\/\/[^?#]+$/i.test(v)) return;
+    var absV = absolutize(v);
+    if (!/^(https?|file):/i.test(absV)) return;
+    if (!SRC_RE.test(v) && !/^(https?|file):\/\/[^?#]+$/i.test(v)) return;
 
     var kind = null;
-    if (/\.m3u8(?:[?#]|$)/i.test(v)) kind = 'hls';
-    else if (/\.mpd(?:[?#]|$)/i.test(v)) kind = 'dash';
-    else if (/\.flv(?:[?#]|$)/i.test(v)) kind = 'flv';
-    else if (/\.ts(?:[?#]|$)/i.test(v)) kind = 'ts';
+    if (/\.m3u8(?:[?#;/]|$)/i.test(v)) kind = 'hls';
+    else if (/\.mpd(?:[?#;/]|$)/i.test(v)) kind = 'dash';
+    else if (/\.flv(?:[?#;/]|$)/i.test(v)) kind = 'flv';
+    else if (/\.ts(?:[?#;/]|$)/i.test(v)) kind = 'ts';
 
     addItem(absolutize(v), kind, { from: from || 'dom', score: 100 });
   }
@@ -452,11 +479,17 @@
       hasVideoEl = true;
       if (IS_TOP) ensureFab();
     }
-    if (!vids.length && hasShadow && (deepScanTick++ % 8 === 0)) {
+    if (deepScanTick++ % 8 === 0) {       // 声明式 Shadow DOM 不触发 attachShadow，必须无条件定期扫
       try {
         var all = document.querySelectorAll('*');
         for (var i = 0; i < all.length && i < 3000; i++) {
-          if (all[i].shadowRoot) collectVideos(all[i].shadowRoot, vids);
+          var sr = all[i].shadowRoot;
+          if (!sr) continue;
+          collectVideos(sr, vids);
+          var nested = sr.querySelectorAll('*');
+          for (var q = 0; q < nested.length && q < 1000; q++) {
+            if (nested[q].shadowRoot) collectVideos(nested[q].shadowRoot, vids);
+          }
         }
       } catch (e) {}
     }
@@ -492,11 +525,11 @@
    *  数据源
    * ------------------------------------------------------------------ */
   function guessKind(url) {
-    if (/\.m3u8(?:[?#]|$)/i.test(url)) return 'hls';
-    if (/\.mpd(?:[?#]|$)/i.test(url)) return 'dash';
-    if (/\.flv(?:[?#]|$)/i.test(url)) return 'flv';
-    if (/\.ts(?:[?#]|$)/i.test(url)) return 'ts';
-    if (/\.webm(?:[?#]|$)/i.test(url)) return 'webm';
+    if (/\.m3u8(?:[?#;/]|$)/i.test(url)) return 'hls';
+    if (/\.mpd(?:[?#;/]|$)/i.test(url)) return 'dash';
+    if (/\.flv(?:[?#;/]|$)/i.test(url)) return 'flv';
+    if (/\.ts(?:[?#;/]|$)/i.test(url)) return 'ts';
+    if (/\.(webm|ogv)(?:[?#;/]|$)/i.test(url)) return 'webm';
     if (/^blob:/i.test(url)) return 'blob';
     return 'mp4';
   }
@@ -531,6 +564,8 @@
       if (extra.score && extra.score > old.score) { old.score = extra.score; bumped = true; }
       if (extra.size && extra.size > old.size) { old.size = extra.size; bumped = true; }
       if (extra.mime && !old.mime) { old.mime = extra.mime; bumped = true; }
+      if (extra.kind && extra.kind !== 'mp4' && old.kind === 'mp4') { old.kind = extra.kind; bumped = true; }
+      if (extra.mimeOnly) { old.mimeOnly = true; bumped = true; }
       if (bumped) {
         listDirty = true;
         if (sheetOpen) scheduleRender();
@@ -559,6 +594,7 @@
       size: extra.size || 0,
       blob: extra.blob || null,
       score: extra.score || 30,
+      mimeOnly: !!extra.mimeOnly,
       ts: Date.now()
     };
     it.title = guessTitle(it);
@@ -568,8 +604,9 @@
     if (sheetOpen) scheduleRender();
     ensureFab();
 
-    if (IS_TOP && it.kind === 'hls' && hlsPrefetchCount < 3) {
-      hlsPrefetchCount++;
+    if (IS_TOP && it.kind === 'hls' && !hlsPrefetched.has(it.url)) {
+      hlsPrefetched.add(it.url);
+      if (hlsPrefetched.size > 8) hlsPrefetched.delete(hlsPrefetched.keys().next().value);
       setTimeout(function () { getPlaylist(it.url).catch(function () {}); }, 600);
     }
     if (IS_TOP) scheduleAutoTakeover();
@@ -2958,7 +2995,25 @@
     playItem(pick);
   }
 
+  function markTakeover(v) {
+    takeoverTried = true;
+    takeoverUrl = location.href;
+    takeoverAt = Date.now();
+    try { takeoverSrc = (v && (v.currentSrc || v.src)) || ''; } catch (e) { takeoverSrc = ''; }
+  }
+
+  function allowRetake(v) {
+    if (!takeoverTried || Date.now() - takeoverAt < 3000) return;
+    var src = '';
+    try { src = (v && (v.currentSrc || v.src)) || ''; } catch (e) {}
+    // 换页 / 换片才允许再接管；刚关掉播放器时同一支片不自动弹回
+    if (location.href !== takeoverUrl || (src && takeoverSrc && src !== takeoverSrc)) {
+      takeoverTried = false;
+    }
+  }
+
   function tryTakeover(v) {
+    allowRetake(v);
     if (takeoverTried || playerOpen || !IS_TOP) return;
     if (!v || v === videoEl || v.tagName !== 'VIDEO') return;
     if (v.videoWidth && v.videoWidth < 200) return;        // 小窗/贴片广告不接管
@@ -2968,9 +3023,9 @@
     if (!r || r.width < 160 || r.height < 90) return;      // 太小的播放框不动
 
     var it = pickPlayable(v);
-    if (!it) return;                                       // 没得换，就让网页自己播
+    if (!it || it.kind === 'dash') return;                 // 没得换，就让网页自己播
 
-    takeoverTried = true;
+    markTakeover(v);
     siteVideo = v;
     try { siteWasPlaying = !v.paused; v.pause(); } catch (e) {}
     playItem(it, { left: r.left, top: r.top, width: r.width, height: r.height, source: v });
@@ -2980,19 +3035,21 @@
     var url = (v && (v.currentSrc || v.src)) || '';
     if (url && /^https?:/i.test(url)) {
       var hit = items.get(absolutize(url));
-      if (hit) return hit;
+      if (hit) return hit.kind === 'dash' ? null : hit;
     }
-    var arr = sortedItems();
+    // fallback 只在高置信 HLS 恰好一个时用，避免多片源页面播错片
+    var arr = sortedItems(), cand = null;
     for (var i = 0; i < arr.length; i++) {
-      if (arr[i].kind === 'hls' && arr[i].score >= 50) return arr[i];
+      if (arr[i].kind !== 'hls' || arr[i].score < 50) continue;
+      if (cand) return null;
+      cand = arr[i];
     }
-    return null;
+    return cand;
   }
 
   var autoTakeoverTimer = 0;
   function scheduleAutoTakeover() {
-    if (!cfg.autoTakeover) return;
-    if (takeoverTried || playerOpen || !IS_TOP || autoTakeoverTimer) return;
+    if (!cfg.autoTakeover || playerOpen || !IS_TOP || autoTakeoverTimer) return;
     autoTakeoverTimer = setTimeout(function () {
       autoTakeoverTimer = 0;
       autoTakeoverNow();
@@ -3000,7 +3057,7 @@
   }
 
   function autoTakeoverNow() {
-    if (takeoverTried || playerOpen || !IS_TOP) return;
+    if (playerOpen || !IS_TOP) return;
 
     var vids = collectVideos(document);
     var best = null, bestArea = 0, bestRect = null;
@@ -3016,10 +3073,13 @@
     }
     if (!best) return;
 
-    var it = pickPlayable(best);
-    if (!it) return;
+    allowRetake(best);
+    if (takeoverTried) return;      // 用户刚关掉、同一支片：别再自动弹回来
 
-    takeoverTried = true;
+    var it = pickPlayable(best);
+    if (!it || it.kind === 'dash') return;
+
+    markTakeover(best);
     siteVideo = best;
     try { siteWasPlaying = !best.paused; best.pause(); } catch (e) {}
     playItem(it, {
@@ -3252,9 +3312,11 @@
       if (!variants.length) return { text: text, url: url, variants: [], codecs: '' };
       variants.sort(function (x, y) { return y.bw - x.bw; });
       var pruned = false;
-      for (var vj = 0; vj < variants.length && variantSet.size < 60; vj++) {
+      for (var vj = 0; vj < variants.length; vj++) {
         var vurl = variants[vj].url;
+        variantSet.delete(vurl);            // 刷新 LRU 顺序
         variantSet.add(vurl);
+        if (variantSet.size > 60) variantSet.delete(variantSet.keys().next().value);
         if (items.delete(vurl)) pruned = true;
       }
       if (pruned) {
@@ -3271,13 +3333,13 @@
     });
   }
 
-  var hlsPrefetchCount = 0;
+  var hlsPrefetched = new Set();
 
   function getPlaylist(url, maxAge) {
     var now = Date.now();
     var hit = playCache.get(url);
     var ttl = (typeof maxAge === 'number') ? maxAge : 60000;   // 注意：0 是合法值，不能用 ||
-    if (hit && (hit.endlist === true || now - hit.ts < ttl)) return hit.p;
+    if (hit && maxAge !== 0 && (hit.endlist === true || now - hit.ts < ttl)) return hit.p;
 
     var rec = { ts: now, p: null, endlist: false };
     rec.p = resolvePlaylist(url).then(function (r) {
@@ -4231,7 +4293,12 @@
         return w.write(new Blob([JSON.stringify(dlTasks)], { type: 'application/json' })).then(function () {
           return w.close();
         });
-      }).catch(function () {});
+      }).catch(function (e) {
+        if (!quotaWarned && e && (e.name === 'QuotaExceededError' || /quota/i.test(String(e.message || '')))) {
+          quotaWarned = true;
+          toast('存储已满：进度无法保存，请导出/清理下载管理');
+        }
+      });
     };
     if (now) return run();
     if (taskFlushPend) return Promise.resolve();
@@ -4505,6 +4572,13 @@
     setTimeout(function () { try { a.remove(); } catch (e) {} }, 8000);
   }
 
+  function quotaHint(e) {
+    if (e && (e.name === 'QuotaExceededError' || /quota|storage full|no space/i.test(String(e.message || '')))) {
+      return '存储已满：请到下载管理导出/删除旧文件后重试';
+    }
+    return (e && e.message) ? ('写入失败：' + e.message) : '写入下载管理失败，请重试';
+  }
+
   function downloadItem(it, resumeTask) {
     if (!it) return;
     var name = it.title || 'video';
@@ -4535,6 +4609,12 @@
       var fname = task ? task.name : name + extOf(it);
       var taskMode = !!partsDir;      // 只有 OPFS 模式支持续传
 
+      function fullGet() {
+        return netFetch(it.url, { credentials: 'same-origin', signal: ctrl.signal }).then(function (r2) {
+          if (!r2.ok) throw new Error('HTTP ' + r2.status);
+          return { r: r2, append: false };
+        });
+      }
       var fetchP;
       if (taskMode && task && offset0 > 0) {
         // 断点续传：从已下位置接着拉
@@ -4542,16 +4622,19 @@
           credentials: 'same-origin', signal: ctrl.signal,
           headers: { Range: 'bytes=' + offset0 + '-' }
         }).then(function (r) {
-          if (r.status === 206) return { r: r, append: true };
+          if (r.status === 206) {
+            // 有些服务端忽略 Range 却回 206 / 返回别的偏移，直接追加会毁掉文件
+            var cr = r.headers.get('content-range') || '';
+            var m = /^bytes\s+(\d+)\s*-/i.exec(cr);
+            if (!m || parseInt(m[1], 10) !== offset0) return fullGet();
+            return { r: r, append: true };
+          }
           if (r.ok) return { r: r, append: false };    // 服务器不理 Range：老实重下
           throw new Error('HTTP ' + r.status);
         }, function (e) {
           if (e && e.name === 'AbortError') throw e;
           // Range 可能引发 CORS 预检被拒：退回普通 GET 重下
-          return netFetch(it.url, { credentials: 'same-origin', signal: ctrl.signal }).then(function (r2) {
-            if (!r2.ok) throw new Error('HTTP ' + r2.status);
-            return { r: r2, append: false };
-          });
+          return fullGet();
         });
       } else {
         fetchP = netFetch(it.url, { credentials: 'same-origin', signal: ctrl.signal }).then(function (r) {
@@ -4599,8 +4682,8 @@
         function loop() {
           return reader.read().then(function (rr) {
             if (rr.done) return t.close();
-            got += rr.value.length;
-            var wq = t.write(rr.value);
+            var chunkLen = rr.value.length;
+            var wq = t.write(rr.value).then(function () { got += chunkLen; });
             var now = Date.now();
             if (now - lastPaint > 250) {
               lastPaint = now;
@@ -4657,7 +4740,9 @@
     }).catch(function (err) {
       dlActive--;
       pg.close();
-      toast('下载启动失败：' + ((err && err.message) || '存储不可用'));
+      toast((err && err.name === 'QuotaExceededError')
+        ? quotaHint(err)
+        : '下载启动失败：' + ((err && err.message) || '存储不可用'));
     });
   }
 
@@ -4820,7 +4905,7 @@
         if (encErr) throw new Error(encErr);
 
         if (pl.map) {
-          tasks.push({ url: pl.map.uri, range: pl.map.range, key: pl.map.key || null, seq: 0, isMap: true });
+          tasks.push({ url: pl.map.uri, range: pl.map.range, key: pl.map.key || null, seq: pl.mediaSeq, isMap: true });
         }
         for (var i = 0; i < pl.segs.length; i++) {
           if (pl.segs[i].gap) continue;   // 占位分片不下载（seq 仍按原始序号算）
@@ -4871,22 +4956,27 @@
         var idx = next++;
         if (task && task.done[idx]) return worker();   // 已下过的跳过
         return grab(tasks[idx], 0).then(function (buf) {
-          if (buf) streak = 0;
-          doneCount++;
           var after = Promise.resolve();
-          if (task && buf) {
-            // 先落盘再标记：半路挂掉也不会有"标记了但文件没有"的洞
-            after = writePart(task.id, idx, buf).then(function () {
-              task.done[idx] = 1;
-              if (Date.now() - lastFlush > 3000) {
-                lastFlush = Date.now();
-                taskFlush();
-              }
-            }, function () { task = null; });   // 写盘失败：降级为内存模式继续下
-          } else if (buf) {
-            results[idx] = new Blob([buf]);
+          if (buf) {
+            streak = 0;
+            doneCount++;                    // 只有真正拿到分片才计完成
+            if (task) {
+              // 先落盘再标记：半路挂掉也不会有"标记了但文件没有"的洞
+              after = writePart(task.id, idx, buf).then(function () {
+                task.done[idx] = 1;
+                if (Date.now() - lastFlush > 3000) {
+                  lastFlush = Date.now();
+                  taskFlush();
+                }
+              }, function () {
+                // 禁止中途降级为内存模式：已落盘的前序分片会全部丢失，合并出空文件
+                throw new Error('分片写盘失败');
+              });
+            } else {
+              results[idx] = new Blob([buf]);
+            }
+            gotBytes += buf.byteLength;
           }
-          if (buf) gotBytes += buf.byteLength;
           var now = Date.now();
           if (now - lastPaint > 250) {
             lastPaint = now;
@@ -4919,22 +5009,23 @@
       }
       return srcP.then(function (rs) {
         var parts = rs.filter(function (x) { return x; });
+        if (parts.length !== tasks.length) throw new Error('有 ' + (tasks.length - parts.length) + ' 个分片缺失，已保留进度可重试');
         var totalBytes = 0;
         for (var i = 0; i < parts.length; i++) totalBytes += parts[i].size || 0;
         var tail = (failed ? '，' + failed + ' 个分片失败' : '') + (pl.endlist ? '' : '，直播流仅当前片段');
 
         function saveDl(blob, fname, msg) {
           pg.close();
-          dlPut(blob, fname).then(function (ent) {
+          return dlPut(blob, fname).then(function (ent) {
             var fin = task ? taskRemove(task.id) : Promise.resolve();
             return fin.then(function () {
               dlActive--;
               renderDownloads();
               if (!autoExportDl(ent)) toast('已存入下载管理：' + ent.name + '（' + msg + '）');
             });
-          }, function () {
+          }, function (e) {
             dlActive--;
-            toast('写入下载管理失败，请重试');
+            toast(quotaHint(e));
           });
         }
 
@@ -4951,9 +5042,9 @@
         pg.sub('');
         return remuxToMp4(parts, function (cur, total) { pg.progress(cur, total); }).then(function (blob) {
           if (!blob || blob.size < totalBytes * 0.4) throw new Error('输出异常');
-          saveDl(blob, name + '.mp4', THREADS + ' 线程' + tail);
-        }).catch(function () {
-          saveDl(new Blob(parts, { type: 'video/mp2t' }), name + '.ts', 'TS，转封装不可用' + tail);
+          return saveDl(blob, name + '.mp4', THREADS + ' 线程' + tail);
+        }, function () {
+          return saveDl(new Blob(parts, { type: 'video/mp2t' }), name + '.ts', 'TS，转封装不可用' + tail);
         });
       });
     }).catch(function (err) {
@@ -4972,7 +5063,8 @@
         renderDownloads();
         return;
       }
-      toast('下载失败：' + (err && err.message ? err.message : '未知') + '，可点“复制”用其他工具');
+      toast((err && err.name === 'QuotaExceededError') ? quotaHint(err)
+        : ('下载失败：' + (err && err.message ? err.message : '未知') + '，可点“复制”用其他工具'));
     });
   }
 
@@ -5057,9 +5149,10 @@
     function tick() {
       if (document.hidden) { setTimeout(tick, 3000); return; }
       ticks++;
+      hasVideoEl = false;                 // 每轮重算：页面移除 video 后要能进入降频
       scanDom();
       if (ticks % 5 === 0) scanPerf();
-      var quiet = !hasVideoEl && !hasMse && items.size === 0;
+      var quiet = !hasVideoEl && items.size === 0;   // hasMse 是粘滞提示位，不参与降频
       idleTicks = quiet ? idleTicks + 1 : 0;
       setTimeout(tick, idleTicks > 20 ? 4000 : 1500);
     }
@@ -5070,7 +5163,11 @@
     try {
       var msg = { __xbvk: 1, url: it.url, kind: it.kind, score: it.score };
       if (it.kind === 'blob' && it.blob) { msg.blob = it.blob; msg.mime = it.mime; }
-      window.parent.postMessage(msg, '*');
+      var target = '*';
+      try {
+        if (location.ancestorOrigins && location.ancestorOrigins.length) target = location.ancestorOrigins[0];
+      } catch (e2) {}
+      window.parent.postMessage(msg, target);
     } catch (e) {}
   }
 
@@ -5092,7 +5189,13 @@
       var d = e.data;
       if (!d || d.__xbvk !== 1) return;
       var fromChild = false;
-      try { fromChild = !!(e.source && e.source !== window && e.source.parent === window); } catch (err) {}
+      try {
+        if (e.source && e.source !== window) {
+          for (var fi = 0; fi < window.frames.length; fi++) {
+            if (window.frames[fi] === e.source) { fromChild = true; break; }   // 不访问 .parent，跨域也可判
+          }
+        }
+      } catch (err) {}
       if (!fromChild) return;
       if (d.blob) {
         try {
@@ -5107,8 +5210,8 @@
         } catch (err) {}
         return;
       }
-      if (!d.url) return;
-      addItem(d.url, d.kind || null, { from: 'frame', score: d.score || 90 });
+      if (!d.url || !/^https?:\/\//i.test(String(d.url))) return;   // 拒绝 javascript:/data: 等注入
+      addItem(String(d.url), d.kind || null, { from: 'frame', score: d.score || 90 });
     });
 
     startScanner();
@@ -5142,6 +5245,7 @@
     } catch (e) {}
   }
   function checkPState() {
+    pStateChecks++;
     if (!playerEl) return;
     var c = playerEl.classList;
     if (c.contains('mini') && !c.contains('embed')) pStateWarn('mini 未伴随 embed');
@@ -5157,6 +5261,7 @@
       get dlActive() { return dlActive; },
       get cfg() { try { return JSON.parse(JSON.stringify(cfg)); } catch (e) { return null; } },
       get warnings() { return (window.__xbvkWarnLog || []).slice(); },
+      get pStateChecks() { return pStateChecks; },
       items: function () {
         return sortedItems().map(function (it) {
           return { id: it.id, kind: it.kind, url: it.url, title: it.title, score: it.score };

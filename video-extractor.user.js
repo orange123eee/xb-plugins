@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频提取器 · 万能播放/下载
 // @namespace    local.xbrowser.videokit
-// @version      3.3.5
+// @version      3.3.6
 // @description  自动嗅探网页视频（直链 / m3u8 / MSE 流），自带播放器（倍速、清晰度切换、全片拖动）与站内下载管理（不跳系统下载器，可打开/分享/导出），多线程下载并合并为 mp4。
 // @author       me
 // @match        *://*/*
@@ -22,7 +22,7 @@
   try { IS_TOP = (window.top === window.self); } catch (e) { IS_TOP = false; }
 
   var MAX_ITEMS = 40;
-  var VERSION = '3.3.5';
+  var VERSION = '3.3.6';
 
   var CFG_KEY = 'xbvk.cfg';
   var cfg = {
@@ -678,7 +678,7 @@
     '.hd button{background:rgba(255,255,255,.07);border:0;color:#c4cbd6;border-radius:8px;padding:6px 10px;',
     'font-size:12px;font-weight:500;transition:background .15s,transform .12s}',
     '.hd button:active{background:rgba(255,255,255,.16);transform:scale(.95)}',
-    '.hint{padding:2px 18px 8px;font-size:11px;color:#6f7683}',
+    '.hint{padding:2px 18px 8px;font-size:11px;color:#9aa2af}',
     '.list{overflow-y:auto;-webkit-overflow-scrolling:touch;padding:4px 12px 10px}',
     '.empty{padding:24px 20px;color:#8b93a1;font-size:13px;text-align:center;line-height:1.8}',
     '.empty svg{display:block;margin:0 auto 10px;opacity:.85}',
@@ -700,7 +700,7 @@
     '.sheet:not(.dltab) .dlist{display:none}',
     '.sheet.dltab .hd [data-a="rescan"]{display:none}',
     '.dlist{overflow-y:auto;-webkit-overflow-scrolling:touch;padding:4px 12px 10px}',
-    '.dluse{display:flex;align-items:center;gap:8px;padding:2px 4px 10px;font-size:11px;color:#6f7683}',
+    '.dluse{display:flex;align-items:center;gap:8px;padding:2px 4px 10px;font-size:11px;color:#9aa2af}',
     '.dluse b{font-weight:500;color:#8b93a1}',
     '.dluse .sp{flex:1}',
     '.dluse button{background:rgba(255,255,255,.07);border:0;color:#c4cbd6;border-radius:7px;',
@@ -718,7 +718,7 @@
     '.dit .nm{flex:1;min-width:0}',
     '.dit .nm b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;',
     'font-weight:500;color:#e9ebef}',
-    '.dit .nm i{font-style:normal;font-size:10.5px;color:#79808d;margin-top:2px;display:block}',
+    '.dit .nm i{font-style:normal;font-size:10.5px;color:#9aa2af;margin-top:2px;display:block}',
     '.dit .acts{display:flex;gap:8px;margin-top:10px}',
     '.dit .acts button{flex:1;height:32px;border-radius:8px;border:1px solid rgba(255,255,255,.1);',
     'background:rgba(255,255,255,.06);color:#dde2ea;font-size:12px;font-weight:500;transition:transform .12s,background .15s}',
@@ -742,8 +742,8 @@
     '.badge.mse{background:rgba(255,171,64,.16);color:#ffb545}',
     '.badge.hls{background:rgba(56,205,150,.16);color:#3ecd96}',
     '.nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13.5px;color:#e9ebef}',
-    '.sz{font-size:11px;color:#79808d;flex:none}',
-    '.u{font-size:11px;color:#6d7480;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:8px;direction:rtl;text-align:left}',
+    '.sz{font-size:11px;color:#9aa2af;flex:none}',
+    '.u{font-size:11px;color:#9aa2af;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:8px;direction:ltr;unicode-bidi:plaintext;text-align:left}',
     '.acts{display:flex;gap:8px}',
     '.acts button{flex:1;height:34px;border-radius:9px;border:1px solid rgba(255,255,255,.1);',
     'background:rgba(255,255,255,.06);color:#dde2ea;font-size:12.5px;font-weight:500;',
@@ -753,7 +753,7 @@
     'box-shadow:0 3px 12px rgba(251,114,153,.32)}',
     '.acts button.pri:active{filter:brightness(1.12);transform:scale(.97)}',
     '.ft{padding:10px 16px 4px;display:flex;gap:8px;align-items:center}',
-    '.ft .ver{font-style:normal;font-size:10px;color:#5d6470;flex:none}',
+    '.ft .ver{font-style:normal;font-size:10px;color:#9aa2af;flex:none}',
     '.ft button{flex:1;height:38px;border-radius:10px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.05);',
     'color:#cfd5de;font-size:13px;transition:background .15s,transform .12s}',
     '.ft button:active{background:rgba(255,255,255,.12);transform:scale(.98)}',
@@ -992,6 +992,9 @@
 
     fabEl = document.createElement('div');
     fabEl.className = 'fab';
+    fabEl.setAttribute('role', 'button');
+    fabEl.setAttribute('tabindex', '0');
+    fabEl.setAttribute('aria-label', '视频提取：点按播放，长按打开列表');
     fabEl.innerHTML =
       '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="#e9ebef" stroke-width="1.8">' +
       '<rect x="2.6" y="4.6" width="18.8" height="14.8" rx="3.2"/>' +
@@ -1067,6 +1070,11 @@
       '<button data-a="clearcache" class="mini">清空</button></div></div>' +
       '</div>';
     root.appendChild(setEl);
+    var sws0 = setEl.querySelectorAll('.sw');
+    for (var swi = 0; swi < sws0.length; swi++) {
+      sws0[swi].setAttribute('role', 'switch');
+      sws0[swi].setAttribute('tabindex', '0');
+    }
     listEl = sheetEl.querySelector('.list');
     dlistEl = sheetEl.querySelector('.dlist');
 
@@ -1120,6 +1128,21 @@
 
     document.documentElement.appendChild(host);
     ui = { host: host, root: root, mask: mask };
+
+    // 静态模板里的纯图标按钮补可访问名称（动态列表按钮都有可见文字）
+    (function () {
+      var MAP = { close: '关闭', back: '返回', full: '全屏', dl: '下载', pip: '画中画', list: '列表',
+        toggle: '播放/暂停', mute: '静音', q: '清晰度', set: '设置', rescan: '重新扫描',
+        rec: '录制当前画面', cancel: '取消', vback: '返回', vshare: '分享', clearcache: '清空缓存' };
+      var bs = root.querySelectorAll('button');
+      for (var bi = 0; bi < bs.length; bi++) {
+        var b = bs[bi];
+        if (b.getAttribute('aria-label')) continue;
+        if ((b.textContent || '').replace(/\s/g, '')) continue;
+        var key = b.getAttribute('data-a') || b.getAttribute('data-act') || '';
+        b.setAttribute('aria-label', MAP[key] || '按钮');
+      }
+    })();
 
     bindUI();
     return ui;
@@ -2183,8 +2206,14 @@
     document.addEventListener('keydown', function (e) {
       if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return;
       var kt = e.target;
+      try { var cp = e.composedPath && e.composedPath(); if (cp && cp[0]) kt = cp[0]; } catch (e2) {}
       if (kt && (kt.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(kt.tagName))) return;
       var k = e.key;
+      // 键盘激活 FAB 与设置开关（它们不是原生 button）
+      if (kt && (k === 'Enter' || k === ' ' || k === 'Spacebar')) {
+        if (kt === fabEl) { tapFab(); e.preventDefault(); return; }
+        if (kt.classList && kt.classList.contains('sw')) { kt.click(); e.preventDefault(); return; }
+      }
       if (k === 'Escape') {
         if (settingsOpen) { closeSettings(); e.preventDefault(); }
         else if (menuOpen) { closeMenus(); e.preventDefault(); }
@@ -2425,7 +2454,9 @@
     if (!setEl) return;
     var sws = setEl.querySelectorAll('.sw');
     for (var i = 0; i < sws.length; i++) {
-      sws[i].classList.toggle('on', !!cfg[sws[i].getAttribute('data-k')]);
+      var on = !!cfg[sws[i].getAttribute('data-k')];
+      sws[i].classList.toggle('on', on);
+      sws[i].setAttribute('aria-checked', on ? 'true' : 'false');
     }
     var segs = setEl.querySelectorAll('.seg');
     for (var j = 0; j < segs.length; j++) {

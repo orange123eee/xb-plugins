@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频提取器 · 万能播放/下载
 // @namespace    local.xbrowser.videokit
-// @version      3.3.4
+// @version      3.3.5
 // @description  自动嗅探网页视频（直链 / m3u8 / MSE 流），自带播放器（倍速、清晰度切换、全片拖动）与站内下载管理（不跳系统下载器，可打开/分享/导出），多线程下载并合并为 mp4。
 // @author       me
 // @match        *://*/*
@@ -22,7 +22,7 @@
   try { IS_TOP = (window.top === window.self); } catch (e) { IS_TOP = false; }
 
   var MAX_ITEMS = 40;
-  var VERSION = '3.3.4';
+  var VERSION = '3.3.5';
 
   var CFG_KEY = 'xbvk.cfg';
   var cfg = {
@@ -43,6 +43,18 @@
   function saveCfg() {
     try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (e) {}
   }
+  // 多标签：别的标签改了设置，本标签跟着生效（只读不写回，避免抖动）
+  try {
+    window.addEventListener('storage', function (e) {
+      if (!e || e.key !== CFG_KEY || !e.newValue) return;
+      try {
+        var o = JSON.parse(e.newValue);
+        for (var k in cfg) { if (o[k] !== undefined && o[k] !== null) cfg[k] = o[k]; }
+        applyCfg();
+        if (settingsOpen) renderSettings();
+      } catch (err) {}
+    });
+  } catch (e) {}
 
   var ICON = {
     play: '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M8 5.2v13.6L19 12z"/></svg>',
@@ -957,7 +969,11 @@
   ].join('');
 
   function buildUI() {
-    if (ui) return ui;
+    if (ui && ui.host && ui.host.isConnected) return ui;
+    if (ui && ui.host && !ui.host.isConnected) {
+      // 页面脚本把 host 摘掉了：挂回去（保留 shadow root 与已绑定的监听），别重建
+      try { document.documentElement.appendChild(ui.host); return ui; } catch (e) {}
+    }
     if (!document.documentElement) return null;
 
     var host = document.createElement('div');
@@ -1482,6 +1498,9 @@
       ui.host.addEventListener('click', function (e) {
         if (Date.now() < uiGuardUntil) { e.stopPropagation(); e.preventDefault(); }
       }, true);
+      // 冒泡到 host 时截断：Shadow retarget 后页面 document 会收到 target=host 的 click，
+      // 不拦会误触页面的关弹层/跳转逻辑
+      ui.host.addEventListener('click', function (e) { e.stopPropagation(); });
     }
 
     function tapFab() {
@@ -2159,6 +2178,25 @@
         });
       } catch (e) {}
     }
+
+    // 键盘：只在插件面板/播放器激活时接管，别抢页面输入框
+    document.addEventListener('keydown', function (e) {
+      if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return;
+      var kt = e.target;
+      if (kt && (kt.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(kt.tagName))) return;
+      var k = e.key;
+      if (k === 'Escape') {
+        if (settingsOpen) { closeSettings(); e.preventDefault(); }
+        else if (menuOpen) { closeMenus(); e.preventDefault(); }
+        else if (sheetOpen) { closeSheet(); e.preventDefault(); }
+        else if (playerOpen) { closePlayer(); e.preventDefault(); }
+        return;
+      }
+      if (!playerOpen) return;
+      if (k === ' ' || k === 'Spacebar' || k === 'k' || k === 'K') { togglePlay(); e.preventDefault(); }
+      else if (k === 'ArrowLeft') { jumpBy(-10); e.preventDefault(); }
+      else if (k === 'ArrowRight') { jumpBy(10); e.preventDefault(); }
+    }, true);
 
     var clearBufText = function () {
       var st = playerEl && playerEl.querySelector('.stat');
@@ -3102,6 +3140,8 @@
     for (var i = 0; i < vids.length; i++) {
       var v = vids[i];
       if (v === videoEl) continue;
+      // 背景/装饰视频（循环播放、静音且无控件）不是用户要看的正片
+      if (v.loop || (v.muted && !v.controls)) continue;
       var r;
       try { r = v.getBoundingClientRect(); } catch (e) { continue; }
       if (!r || r.width < 260 || r.height < 140) continue;              // 小窗不动
@@ -4246,7 +4286,14 @@
     if (this.ctrl) { try { this.ctrl.abort(); } catch (e) {} this.ctrl = null; }
     if (this.boundSeek) { try { this.video.removeEventListener('seeking', this.boundSeek); } catch (e) {} }
     try { if (this.ms) this.ms.endOfStream(); } catch (e) {}
-    if (this.objUrl) { try { URL.revokeObjectURL(this.objUrl); } catch (e) {} }
+    try {
+      if (this.ms && this.ms.sourceBuffers && this.ms.sourceBuffers.length && this.sb) {
+        if (this.sb.updating) this.sb.abort();
+        this.ms.removeSourceBuffer(this.sb);
+      }
+    } catch (e) {}
+    this.sb = null;
+    if (this.objUrl) { try { URL.revokeObjectURL(this.objUrl); } catch (e) {} this.objUrl = null; }
   };
 
   /* ------------------------------------------------------------------ *
@@ -5183,15 +5230,28 @@
 
     try {
       var stream = v.captureStream();
-      var mime = 'video/webm;codecs=vp8,opus';
-      if (!window.MediaRecorder || !MediaRecorder.isTypeSupported(mime)) mime = 'video/webm';
-      recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 4000000 });
+      if (!window.MediaRecorder) { toast('当前内核不支持录制'); return; }
+      var CAND = ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm', 'video/mp4'];
+      var mime = '';
+      for (var ci = 0; ci < CAND.length; ci++) {
+        try { if (MediaRecorder.isTypeSupported(CAND[ci])) { mime = CAND[ci]; break; } } catch (e2) {}
+      }
+      var ropt = { videoBitsPerSecond: 4000000 };
+      if (mime) ropt.mimeType = mime;      // 全不支持时交给内核默认
+      recorder = new MediaRecorder(stream, ropt);
+      var outMime = mime || recorder.mimeType || 'video/webm';
+      var ext = outMime.indexOf('mp4') >= 0 ? '.mp4' : '.webm';
       recChunks = [];
-      recName = sanitize(document.title || 'video') + '.webm';
-      recorder.ondataavailable = function (e) { if (e.data && e.data.size) recChunks.push(e.data); };
+      recName = sanitize(document.title || 'video') + ext;
+      recorder.ondataavailable = function (e) {
+        if (e.data && e.data.size) recChunks.push(e.data);
+        var total = 0;
+        for (var rj = 0; rj < recChunks.length; rj++) total += recChunks[rj].size;
+        if (total > 120 * 1024 * 1024 && recorder && recorder.state === 'recording') recorder.stop();
+      };
       recorder.onstop = function () {
-        var blob = new Blob(recChunks, { type: 'video/webm' });
-        dlPut(blob, recName, 'video/webm').then(function (ent) {
+        var blob = new Blob(recChunks, { type: outMime });
+        dlPut(blob, recName, outMime).then(function (ent) {
           renderDownloads();
           if (!autoExportDl(ent)) toast('录制已存入下载管理：' + ent.name);
         }, function () { toast('录制保存失败'); });

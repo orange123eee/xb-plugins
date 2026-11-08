@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频提取器 · 万能播放/下载
 // @namespace    local.xbrowser.videokit
-// @version      3.3.2
+// @version      3.3.3
 // @description  自动嗅探网页视频（直链 / m3u8 / MSE 流），自带播放器（倍速、清晰度切换、全片拖动）与站内下载管理（不跳系统下载器，可打开/分享/导出），多线程下载并合并为 mp4。
 // @author       me
 // @match        *://*/*
@@ -22,7 +22,7 @@
   try { IS_TOP = (window.top === window.self); } catch (e) { IS_TOP = false; }
 
   var MAX_ITEMS = 40;
-  var VERSION = '3.3.2';
+  var VERSION = '3.3.3';
 
   var CFG_KEY = 'xbvk.cfg';
   var cfg = {
@@ -1265,8 +1265,13 @@
     } catch (e) {}
     var bp = dur ? Math.min(1, Math.max(0, (end - playerOff()) / dur)) : 0;
     n.buf.style.width = (bp * 100).toFixed(2) + '%';
-    n.tm.textContent = fmtTime(pos) + ' / ' + fmtTime(dur);
-    n.toggle.innerHTML = videoEl.paused ? ICON.play : ICON.pause;
+    var tmStr = fmtTime(pos) + ' / ' + fmtTime(dur);
+    if (n.tm.textContent !== tmStr) n.tm.textContent = tmStr;   // timeupdate 高频，别每帧重建 SVG
+    var ps = videoEl.paused ? 'p' : 'q';
+    if (n.toggle.getAttribute('data-ps') !== ps) {
+      n.toggle.innerHTML = ps === 'p' ? ICON.play : ICON.pause;
+      n.toggle.setAttribute('data-ps', ps);
+    }
     playerEl.classList.toggle('paused', !!videoEl.paused);
     playerEl.classList.toggle('ended', !!videoEl.ended || forcedEnded);
     if (!seekUI.pending) { seekUI.hard = false; }
@@ -2433,6 +2438,10 @@
   function renderList() {
     if (!listEl) return;
     listDirty = false;
+    var keepTop = listEl.scrollTop;      // 全量重建后恢复滚动位置
+    try {
+      requestAnimationFrame(function () { try { listEl.scrollTop = keepTop; } catch (e2) {} });
+    } catch (e) {}
     var arr = sortedItems();
     var cnt = sheetEl.querySelector('.cnt');
     if (cnt) cnt.textContent = arr.length ? arr.length + ' 个' : '';
@@ -2565,6 +2574,10 @@
     }
     if (!dlTabOpen) return;
 
+    var keepTop = dlistEl.scrollTop;
+    try {
+      requestAnimationFrame(function () { try { dlistEl.scrollTop = keepTop; } catch (e2) {} });
+    } catch (e) {}
     dlistEl.innerHTML = '';
 
     var use = document.createElement('div');
@@ -3409,7 +3422,7 @@
     var lines = text.split(/\r?\n/);
     var segs = [];
     var key = null, map = null, dur = 0, endlist = false, mediaSeq = 0;
-    var pendingRange = null, lastRangeEnd = 0, gapNext = false;
+    var pendingRange = null, lastRangeEnd = 0, gapNext = false, discSeq = 0;
 
     for (var i = 0; i < lines.length; i++) {
       var l = lines[i].trim();
@@ -3435,6 +3448,8 @@
         endlist = true;
       } else if (l.indexOf('#EXT-X-GAP') === 0) {
         gapNext = true;   // 占位分片：时长留着占时间轴，但不下载
+      } else if (l === '#EXT-X-DISCONTINUITY' || l.indexOf('#EXT-X-DISCONTINUITY:') === 0) {
+        discSeq++;        // 时间戳不连续（广告插播/拼接）：只标记，不假装连续
       } else if (l.charAt(0) !== '#') {
         segs.push({
           url: absolutize2(l, baseUrl),
@@ -3443,6 +3458,7 @@
           start: 0,
           map: map,
           gap: gapNext,
+          disc: discSeq,
           range: pendingRange ? (pendingRange.offset + '-' + (pendingRange.offset + pendingRange.length - 1)) : null
         });
         pendingRange = null;
@@ -3456,7 +3472,8 @@
       segs[k].start = t;
       t += segs[k].dur;
     }
-    return { segs: segs, map: map, total: t, endlist: endlist, mediaSeq: mediaSeq };
+    return { segs: segs, map: map, total: t, endlist: endlist, mediaSeq: mediaSeq,
+             hasDisc: discSeq > 0, discCount: discSeq };
   }
 
   function pickMime(isFmp4, codecs) {
@@ -3654,6 +3671,9 @@
       self.mediaSeq = pl.mediaSeq;
       self.total = pl.total;
       self.endlist = pl.endlist;
+      self.hasDisc = !!pl.hasDisc;
+      self.discCount = pl.discCount || 0;
+      if (self.hasDisc) toast('该流含 ' + self.discCount + ' 处拼接段，时间轴可能跳变（建议下载后播放）');
       self.variants = r.variants || [];
       self.variantIndex = 0;
       for (var vi = 0; vi < self.variants.length; vi++) {
@@ -4521,7 +4541,8 @@
     var ok = false;
     try { a.click(); ok = true; } catch (e) {}
     setTimeout(function () { try { a.remove(); } catch (e) {} }, 8000);
-    setTimeout(function () { try { URL.revokeObjectURL(url); } catch (e) {} }, 600000);
+    // 3 分钟足够系统下载/分享取走文件，避免大文件 blob URL 常驻 10 分钟占内存
+    setTimeout(function () { try { URL.revokeObjectURL(url); } catch (e) {} }, 180000);
     if (ok) toast('已导出：' + name + '（视频类建议在下载管理里用「保存 / 分享」走系统分享，更可靠）');
     else toast('导出没成功，请长按链接另存');
   }
@@ -4774,18 +4795,24 @@
     function tryOne(i) {
       if (i >= MUX_CDNS.length) return Promise.reject(new Error('mux.js 所有源都加载失败'));
       return new Promise(function (res, rej) {
-        var done = false;
+        var done = false, timer = 0;
         var s = document.createElement('script');
-        s.src = MUX_CDNS[i];
-        s.onload = function () {
+        function cleanup() {
+          clearTimeout(timer);
+          s.onload = s.onerror = null;
+          try { s.remove(); } catch (e) {}      // 成功/失败都不留游离 script 节点和定时器
+        }
+        function finish(err, val) {
           if (done) return;
           done = true;
-          if (window.muxjs) res(window.muxjs);
-          else rej(new Error('mux.js 不可用'));
-        };
-        s.onerror = function () { if (done) return; done = true; rej(new Error('mux.js 加载失败')); };
+          cleanup();
+          if (err) rej(err); else res(val);
+        }
+        s.src = MUX_CDNS[i];
+        s.onload = function () { finish(window.muxjs ? null : new Error('mux.js 不可用'), window.muxjs); };
+        s.onerror = function () { finish(new Error('mux.js 加载失败')); };
         (document.head || document.documentElement).appendChild(s);
-        setTimeout(function () { if (!done) { done = true; rej(new Error('mux.js 加载超时')); } }, 6000);
+        timer = setTimeout(function () { finish(new Error('mux.js 加载超时')); }, 6000);
       }).catch(function () { return tryOne(i + 1); });
     }
     muxPromise = tryOne(0);
@@ -4897,6 +4924,8 @@
       if (resumeTask) {
         tasks = resumeTask.segs;
         pl = c.pl;
+        pl.hasDisc = !!resumeTask.hasDisc;
+        pl.discCount = resumeTask.discCount || 0;
         task = resumeTask;
       } else {
         pl = c.pl;
@@ -4933,7 +4962,7 @@
           kind: 'hls', name: name, url: it.url, page: location.host, ts: Date.now(),
           segs: tasks, done: tasks.map(function () { return 0; }),
           map: pl.map ? { uri: pl.map.uri, range: pl.map.range } : null,
-          endlist: true
+          endlist: true, hasDisc: !!pl.hasDisc, discCount: pl.discCount || 0
         };
         dlTasks.unshift(task);
         taskFlush(true);
@@ -5013,6 +5042,11 @@
         var totalBytes = 0;
         for (var i = 0; i < parts.length; i++) totalBytes += parts[i].size || 0;
         var tail = (failed ? '，' + failed + ' 个分片失败' : '') + (pl.endlist ? '' : '，直播流仅当前片段');
+        if (pl.hasDisc) {
+          // 多个不同 init 段/时间戳基准的 fMP4 拼成一个 MP4 必然错乱，宁可明确拒绝也别产出坏文件
+          if (pl.map) throw new Error('该流含 ' + (pl.discCount || 1) + ' 处拼接段，fMP4 合并会时间轴错乱；请用「录制当前画面」');
+          tail += '，含拼接段时间轴可能跳变';
+        }
 
         function saveDl(blob, fname, msg) {
           pg.close();
@@ -5059,7 +5093,7 @@
       }
       if (task) {
         taskFlush(true);
-        toast('下载中断：进度已保存，可在下载管理继续');
+        toast('下载中断：' + ((err && err.message) || '未知原因') + '，进度已保存可在下载管理继续');
         renderDownloads();
         return;
       }
@@ -5283,7 +5317,8 @@
         return hls ? {
           gen: hls.gen, loadCount: hls.loadCount, segs: hls.segs.length,
           transmux: hls.transmux, ptsOffset: hls.ptsOffset,
-          total: hls.total, startedAt: hls.startedAt
+          total: hls.total, startedAt: hls.startedAt,
+          hasDisc: !!hls.hasDisc, discCount: hls.discCount || 0
         } : null;
       },
       // 读下载文件片段（测试校验字节用）

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频提取器 · 万能播放/下载
 // @namespace    local.xbrowser.videokit
-// @version      3.3.3
+// @version      3.3.4
 // @description  自动嗅探网页视频（直链 / m3u8 / MSE 流），自带播放器（倍速、清晰度切换、全片拖动）与站内下载管理（不跳系统下载器，可打开/分享/导出），多线程下载并合并为 mp4。
 // @author       me
 // @match        *://*/*
@@ -22,7 +22,7 @@
   try { IS_TOP = (window.top === window.self); } catch (e) { IS_TOP = false; }
 
   var MAX_ITEMS = 40;
-  var VERSION = '3.3.3';
+  var VERSION = '3.3.4';
 
   var CFG_KEY = 'xbvk.cfg';
   var cfg = {
@@ -61,6 +61,7 @@
   var rawFetch = (typeof window.fetch === 'function') ? window.fetch.bind(window) : null;
 
   var selfReqs = new Set();
+  var failedReqs = new Set();   // fetch 失败/非 2xx 的 URL，perf 通道别再捡回列表
   var variantSet = new Set();
 
   function netFetch(url, init) {
@@ -275,9 +276,22 @@
           var abs0 = absolutize(url);
           var hadItem = items.has(abs0);
           var ghost = NET_RE.test(url) ? addItem(abs0, null, { from: 'net', score: 50 }) : null;
+          var dropGhost = function () {
+            // 记下失败 URL：PerformanceObserver 随后仍会看到这条请求，别让它把幽灵条目捡回来
+            failedReqs.add(abs0);
+            if (failedReqs.size > 200) failedReqs.delete(failedReqs.keys().next().value);
+            // 只清本次 fetch 新建、且没被别的通道升级过的条目
+            if (ghost && !hadItem && items.get(abs0) === ghost && ghost.score <= 50) {
+              items.delete(abs0);
+              listDirty = true;
+              if (sheetOpen) scheduleRender();
+              ensureFab();
+            }
+          };
 
           p.then(function (r) {
             try {
+              if (!r.ok) { dropGhost(); return; }   // 404/5xx 同样不留幽灵条目
               var rawType = r.headers.get('content-type') || '';
               var type = rawType.split(';')[0].trim().toLowerCase();
               var byUrl = NET_RE.test(url);
@@ -292,15 +306,7 @@
                 r.clone().text().then(function (t) { seedText(abs0, t); }, function () {});
               }
             } catch (e) {}
-          }, function () {
-            // 请求失败：清掉刚建的幽灵条目，别触发预取/自动接管
-            if (ghost && !hadItem && items.get(abs0) === ghost && ghost.score <= 50) {
-              items.delete(abs0);
-              listDirty = true;
-              if (sheetOpen) scheduleRender();
-              ensureFab();
-            }
-          });
+          }, function () { dropGhost(); });
         }
       } catch (e) {}
       return p;
@@ -330,7 +336,7 @@
       if (es.length < perfIndex) perfIndex = 0;   // 缓冲区被清空过
       for (var i = perfIndex; i < es.length; i++) {
         var n = es[i].name;
-        if (n && NET_RE.test(n)) {
+        if (n && NET_RE.test(n) && !failedReqs.has(n)) {
           addItem(n, null, {
             from: 'perf',
             size: es[i].encodedBodySize || es[i].transferSize || 0,
@@ -354,7 +360,7 @@
         var es = l.getEntries();
         for (var i = 0; i < es.length; i++) {
           var n = es[i].name;
-          if (n && NET_RE.test(n)) {
+          if (n && NET_RE.test(n) && !failedReqs.has(n)) {
             addItem(n, null, { from: 'perf', size: es[i].encodedBodySize || 0, score: 40 });
           }
         }
@@ -1467,8 +1473,16 @@
 
   function bindUI() {
     var sx = 0, sy = 0, ox = 0, oy = 0, moved = false, dragging = false;
-    var pressTimer = 0, lastTap = 0;
+    var pressTimer = 0, lastTap = 0, longPressSkip = 0;
     var TAP_SLOP = 14;
+
+    // 防误点统一收口：host 捕获阶段拦掉窗口期内的 click，
+    // 否则长按开面板后 touchend 补发的 click 可能落到下载页的「删除/清空」上
+    if (ui && ui.host) {
+      ui.host.addEventListener('click', function (e) {
+        if (Date.now() < uiGuardUntil) { e.stopPropagation(); e.preventDefault(); }
+      }, true);
+    }
 
     function tapFab() {
       var now = Date.now();
@@ -1479,6 +1493,7 @@
     }
 
     function pressStart(x, y) {
+      longPressSkip = 0;             // 新手势，清掉上次长按的抑制
       dragging = true; moved = false;
       var r = fabEl.getBoundingClientRect();
       sx = x; sy = y; ox = r.left; oy = r.top;
@@ -1489,6 +1504,7 @@
           dragging = false;
           fabEl.classList.remove('press');
           lastTap = Date.now();          // 让随后的 tap 被去重挡掉
+          longPressSkip = 2;            // 跳过本次 touchend + 补发的 click（按住再久也不穿透）
           try { openSheet(); } catch (err) {}
         }
       }, 550);
@@ -1497,6 +1513,7 @@
     function pressEnd(x, y) {
       clearTimeout(pressTimer);
       fabEl.classList.remove('press');
+      if (longPressSkip > 0) { longPressSkip--; dragging = false; moved = false; return; }
       if (!dragging) { tapFab(); return; }   // 没收到 touchstart 也当成点击，别把事件丢了
       dragging = false;
       var dx = (x == null) ? 0 : Math.abs(x - sx);
@@ -1547,6 +1564,7 @@
     }, { passive: true });
 
     fabEl.addEventListener('click', function (e) {
+      if (longPressSkip > 0) { longPressSkip--; e.stopPropagation(); e.preventDefault(); return; }
       if (moved) { e.stopPropagation(); e.preventDefault(); return; }
       tapFab();
     });
@@ -1627,6 +1645,7 @@
 
     if (dlistEl) {
       dlistEl.addEventListener('click', function (e) {
+        if (Date.now() < uiGuardUntil) return;
         var t = e.target;
         while (t && t !== dlistEl && t.tagName !== 'BUTTON') t = t.parentNode;
         if (!t || t === dlistEl) return;
@@ -2413,6 +2432,12 @@
     if (!sheetEl) return;
     if (settingsOpen) closeSettings();
     sheetOpen = false;
+    dlTabOpen = false;                 // 收起后回到视频页，避免补发 click 命中删除/清空
+    sheetEl.classList.remove('dltab');
+    var tabBtns = sheetEl.querySelectorAll('.tabs button');
+    for (var tb = 0; tb < tabBtns.length; tb++) {
+      tabBtns[tb].classList.toggle('on', tabBtns[tb].getAttribute('data-v') === 'video');
+    }
     sheetEl.classList.remove('open');
     ui.mask.classList.remove('on');
     if (playerHiddenForSheet && playerOpen) {
@@ -4283,6 +4308,21 @@
       });
       return Promise.all(checks).then(function (alive) {
         dlMan.files = alive.filter(function (f) { return f; });
+        if (!partsDir) return;
+        // 恢复任务前探活 parts/<id>：目录被系统清掉时继续下载会合并出空文件
+        var tchecks = dlTasks.map(function (t) {
+          if (!t || !t.id) return Promise.resolve(null);
+          return partsDir.getDirectoryHandle(t.id).then(function (d) {
+            var done = t.done || [], first = -1;
+            for (var q = 0; q < done.length; q++) { if (done[q]) { first = q; break; } }
+            if (first < 0) return t;      // 还没落任何分片的新任务，保留
+            return d.getFileHandle(String(first)).then(function () { return t; }).catch(function () { return null; });
+          }).catch(function () { return null; });
+        });
+        return Promise.all(tchecks).then(function (aliveTasks) {
+          var kept = aliveTasks.filter(function (t) { return t; });
+          if (kept.length !== dlTasks.length) { dlTasks = kept; return taskFlush(true); }
+        });
       });
     }).catch(function () {});
     return dlReady;
@@ -4303,15 +4343,21 @@
   /* ---------- 断点续传：任务表 + 分片读写 ---------- */
 
   var taskFlushPend = false;
+  var taskDebounceTimer = 0;
+  var taskWritePend = Promise.resolve();     // 写队列：同一时刻只有一个 tasks.json 写入
   function taskFlush(now) {
     if (!partsDir) return Promise.resolve();
     var run = function () {
       taskFlushPend = false;
-      return partsDir.getFileHandle('tasks.json', { create: true }).then(function (h) {
-        return h.createWritable();
-      }).then(function (w) {
-        return w.write(new Blob([JSON.stringify(dlTasks)], { type: 'application/json' })).then(function () {
-          return w.close();
+      // 快照在轮到写时取，且严格串行：避免与 taskRemove 并发时旧快照复活已删任务
+      taskWritePend = taskWritePend.catch(function () {}).then(function () {
+        var snapshot = JSON.stringify(dlTasks);
+        return partsDir.getFileHandle('tasks.json', { create: true }).then(function (h) {
+          return h.createWritable();
+        }).then(function (w) {
+          return w.write(new Blob([snapshot], { type: 'application/json' })).then(function () {
+            return w.close();
+          });
         });
       }).catch(function (e) {
         if (!quotaWarned && e && (e.name === 'QuotaExceededError' || /quota/i.test(String(e.message || '')))) {
@@ -4319,11 +4365,19 @@
           toast('存储已满：进度无法保存，请导出/清理下载管理');
         }
       });
+      return taskWritePend;
     };
-    if (now) return run();
+    if (now) {
+      // 立即写要取消防抖，否则 600ms 后还会再写一份（可能更旧的）快照
+      if (taskDebounceTimer) { clearTimeout(taskDebounceTimer); taskDebounceTimer = 0; }
+      taskFlushPend = false;
+      return run();
+    }
     if (taskFlushPend) return Promise.resolve();
     taskFlushPend = true;
-    return sleep(600).then(run);
+    return new Promise(function (res) {
+      taskDebounceTimer = setTimeout(function () { taskDebounceTimer = 0; res(run()); }, 600);
+    });
   }
 
   function taskDirOf(id, create) {
@@ -4593,6 +4647,12 @@
     setTimeout(function () { try { a.remove(); } catch (e) {} }, 8000);
   }
 
+  // 206 的 Content-Range 起点必须等于请求的 offset，否则服务端在骗我们
+  function rangeStartOk(cr, offset) {
+    var m = /^bytes\s+(\d+)\s*-/i.exec(String(cr || ''));
+    return !!m && parseInt(m[1], 10) === offset;
+  }
+
   function quotaHint(e) {
     if (e && (e.name === 'QuotaExceededError' || /quota|storage full|no space/i.test(String(e.message || '')))) {
       return '存储已满：请到下载管理导出/删除旧文件后重试';
@@ -4645,9 +4705,7 @@
         }).then(function (r) {
           if (r.status === 206) {
             // 有些服务端忽略 Range 却回 206 / 返回别的偏移，直接追加会毁掉文件
-            var cr = r.headers.get('content-range') || '';
-            var m = /^bytes\s+(\d+)\s*-/i.exec(cr);
-            if (!m || parseInt(m[1], 10) !== offset0) return fullGet();
+            if (!rangeStartOk(r.headers.get('content-range'), offset0)) return fullGet();
             return { r: r, append: true };
           }
           if (r.ok) return { r: r, append: false };    // 服务器不理 Range：老实重下

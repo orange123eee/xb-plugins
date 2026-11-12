@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频提取器 · 万能播放/下载
 // @namespace    local.xbrowser.videokit
-// @version      3.4.0
+// @version      3.4.1
 // @description  自动嗅探网页视频（直链 / m3u8 / MSE 流），自带播放器（倍速、清晰度切换、全片拖动）与站内下载管理（不跳系统下载器，可打开/分享/导出），多线程下载并合并为 mp4。
 // @author       me
 // @match        *://*/*
@@ -22,7 +22,7 @@
   try { IS_TOP = (window.top === window.self); } catch (e) { IS_TOP = false; }
 
   var MAX_ITEMS = 40;
-  var VERSION = '3.4.0';
+  var VERSION = '3.4.1';
 
   var CFG_KEY = 'xbvk.cfg';
   var cfg = {
@@ -951,6 +951,13 @@
     '.set.open{transform:translateY(0)}',
     '.set .hd{display:flex;align-items:center;gap:8px;padding:14px 16px 10px;border-bottom:1px solid rgba(255,255,255,.07)}',
     '.set .hd h3{margin:0;font-size:15px;font-weight:600;flex:1}',
+    '.set .hd .vtag{font-style:normal;font-size:11px;color:#9aa2af;font-weight:400;margin-left:4px}',
+    '.diagrow{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px;',
+    'margin:10px 0 4px;border:1px solid rgba(255,255,255,.12);border-radius:12px;background:rgba(255,255,255,.04)}',
+    '.diagrow b{display:block;font-size:13px;color:#e9ebef;font-weight:600}',
+    '.diagrow i{display:block;font-style:normal;font-size:11.5px;color:#9aa2af;line-height:1.5;margin-top:3px}',
+    '.diagrow .mini{flex:none;height:36px;padding:0 14px;border:0;border-radius:9px;',
+    'background:#fb7299;color:#fff;font-size:12.5px;font-weight:600}',
     '.set .hd button{background:rgba(255,255,255,.1);border:0;color:#cfd5de;border-radius:9px;padding:7px 14px;font-size:12.5px}',
     '.set .sbody{padding:4px 16px 8px;overflow-y:auto;-webkit-overflow-scrolling:touch}',
     '.srow{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 0;',
@@ -1071,8 +1078,12 @@
     setEl = document.createElement('div');
     setEl.className = 'set';
     setEl.innerHTML =
-      '<div class="hd"><h3>设置</h3><button data-a="close">完成</button></div>' +
+      '<div class="hd"><h3>设置 <i class="vtag">v' + VERSION + '</i></h3>' +
+      '<button data-a="close">完成</button></div>' +
       '<div class="sbody">' +
+      '<div class="diagrow"><div><b>加载慢 / 播不了？</b>' +
+      '<i>点右边复制诊断，把内容粘给开发者</i></div>' +
+      '<button data-a="diag" class="mini">复制诊断</button></div>' +
       '<div class="sgrp">播 放</div>' +
       '<div class="srow"><span>自动接管网页播放器</span><b class="sw" data-k="autoTakeover"></b></div>' +
       '<div class="srow"><span>画面手势（拖动/双击/长按/音量亮度）</span><b class="sw" data-k="gestures"></b></div>' +
@@ -1091,7 +1102,6 @@
       '<div class="srow"><span>边看边缓存</span><b class="sw" data-k="segCache"></b></div>' +
       '<div class="srow"><span>缓存占用</span><div class="cwrap"><i class="csz">0 MB</i>' +
       '<button data-a="clearcache" class="mini">清空</button></div></div>' +
-      '<div class="srow"><span>出问题时复制诊断</span><button data-a="diag" class="mini">复制诊断</button></div>' +
       '</div>';
     root.appendChild(setEl);
     var sws0 = setEl.querySelectorAll('.sw');

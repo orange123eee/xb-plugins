@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频提取器 · 万能播放/下载
 // @namespace    local.xbrowser.videokit
-// @version      3.4.1
+// @version      3.4.2
 // @description  自动嗅探网页视频（直链 / m3u8 / MSE 流），自带播放器（倍速、清晰度切换、全片拖动）与站内下载管理（不跳系统下载器，可打开/分享/导出），多线程下载并合并为 mp4。
 // @author       me
 // @match        *://*/*
@@ -22,7 +22,7 @@
   try { IS_TOP = (window.top === window.self); } catch (e) { IS_TOP = false; }
 
   var MAX_ITEMS = 40;
-  var VERSION = '3.4.1';
+  var VERSION = '3.4.2';
 
   var CFG_KEY = 'xbvk.cfg';
   var cfg = {
@@ -126,6 +126,15 @@
   var pStateChecks = 0;
   var quotaWarned = false;
   var errLog = [];              // 最近错误环形缓冲（诊断快照用）
+  var ttff = {};                // 起播分阶段耗时（ms，相对 tap）
+  function markT(name) {
+    try {
+      var t = (window.performance && performance.now) ? performance.now() : Date.now();
+      if (ttff.t0 == null) ttff.t0 = t;
+      if (ttff[name] == null) ttff[name] = Math.round(t - ttff.t0);
+    } catch (e) {}
+  }
+  function resetT() { ttff = {}; markT('tap'); }
   var resetStageGesture = function () {};   // bindUI 里赋值，换片时重置手势状态
   var playerHiddenForSheet = false;   // 从播放器打开列表时先把播放器藏起来，收起列表要放回去
   var deepScanTick = 0;
@@ -146,6 +155,7 @@
   var segCacheBytes = 0;
   var SEG_CACHE_MAX = 40 * 1024 * 1024;
 
+  // 2 小时长流会有上千分片：淘汰必须 O(1)，不能每次遍历整个 Map 找最旧
   function putSegCache(key, buf) {
     if (!cfg.segCache) return;                          // 用户关掉了缓存
     if (!buf || !buf.byteLength) return;
@@ -154,14 +164,10 @@
     segCache.set(key, { buf: buf, ts: Date.now() });
     segCacheBytes += buf.byteLength;
     while (segCacheBytes > SEG_CACHE_MAX && segCache.size > 1) {
-      var oldest = null, oldestTs = Infinity;
-      segCache.forEach(function (v, k) {
-        if (v && v.ts < oldestTs) { oldestTs = v.ts; oldest = k; }
-      });
-      if (oldest == null) break;
-      var v = segCache.get(oldest);
+      var oldKey = segCache.keys().next().value;         // Map 保持插入顺序
+      var v = segCache.get(oldKey);
       segCacheBytes -= (v && v.buf && v.buf.byteLength) || 0;
-      segCache.delete(oldest);
+      segCache.delete(oldKey);
     }
   }
 
@@ -648,7 +654,18 @@
     if (IS_TOP && it.kind === 'hls' && !hlsPrefetched.has(it.url)) {
       hlsPrefetched.add(it.url);
       if (hlsPrefetched.size > 8) hlsPrefetched.delete(hlsPrefetched.keys().next().value);
-      setTimeout(function () { getPlaylist(it.url).catch(function () {}); }, 600);
+      setTimeout(function () {
+        getPlaylist(it.url).then(function (c) {
+          var segs = c && c.pl && c.pl.segs;
+          if (!segs || !segs.length || !cfg.segCache) return;
+          var first = null;
+          for (var q = 0; q < segs.length && q < 3; q++) { if (!segs[q].gap) { first = segs[q]; break; } }
+          if (!first) return;
+          var k = cacheKey(first.url, first.range);
+          if (segCache.has(k)) return;
+          fetchBuf(first.url, { range: first.range }).then(function (b) { putSegCache(k, b); }).catch(function () {});
+        }).catch(function () {});
+      }, 600);
     }
     if (IS_TOP) scheduleAutoTakeover();
     return it;
@@ -2348,6 +2365,7 @@
       if (!seekUI.pending) hideFreeze();
     });
     videoEl.addEventListener('loadeddata', function () {
+      if (ttff.firstFrame == null) markT('firstFrame');
       if (!seekUI.pending) hideFreeze();
     });
     videoEl.addEventListener('seeked', function () {
@@ -3295,11 +3313,17 @@
 
   function playItem(it, rect) {
     if (!it) return;
+    resetT();
     current = it;
     setMediaMeta(it);
     if (it.kind === 'dash') { toast('DASH 流暂不支持直接播放，已复制地址'); copyText(it.url); return; }
 
     openPlayer(it.title, rect);
+    try {
+      if (videoEl.requestVideoFrameCallback) {
+        videoEl.requestVideoFrameCallback(function () { if (ttff.firstFrame == null) markT('firstFrame'); });
+      }
+    } catch (e) {}
 
     if (it.kind === 'hls') {
       videoEl.removeAttribute('src');
@@ -3436,14 +3460,20 @@
     return out;
   }
 
+  var credPolicy = new Map();   // origin -> 上次成功的 credentials，跨域流每片省一次失败往返
+  function originOf(u) { try { return new URL(u).origin; } catch (e) { return ''; } }
+
   function xfetch(url, asText, opt) {
     opt = opt || {};
+    var origin = originOf(url);
+    var firstCred = credPolicy.get(origin) || 'same-origin';
     function once(cred, sendRange) {
       var init = { credentials: cred };
       if (opt.signal) init.signal = opt.signal;
       if (sendRange && opt.range) init.headers = { Range: 'bytes=' + opt.range };
       return netFetch(url, init).then(function (r) {
         if (!r.ok && r.status !== 206) throw new Error('HTTP ' + r.status);
+        try { credPolicy.set(origin, cred); } catch (e0) {}
         var partial = (r.status === 206);
         return (asText ? r.text() : r.arrayBuffer()).then(function (data) {
           // 服务端忽略 Range 回了 200：本地按请求范围切出来，别把整片当分片用
@@ -3455,13 +3485,15 @@
         });
       });
     }
-    return once('same-origin', true).catch(function (e) {
+    function noRangeRetry(err) {
+      if (!opt.range || (err && err.name === 'AbortError')) throw err;
+      return once('include', false);              // 去掉 Range 再试（CORS 预检常见原因）
+    }
+    return once(firstCred, true).catch(function (e) {
       if (e && e.name === 'AbortError') throw e;
       if (e && /^HTTP /.test(e.message)) throw e;   // 服务端明确报错，不必重试
-      return once('include', true).catch(function (e2) {
-        if (!opt.range || (e2 && e2.name === 'AbortError')) throw e2;
-        return once('include', false);              // 去掉 Range 再试（CORS 预检常见原因）
-      });
+      if (firstCred === 'include') return noRangeRetry(e);  // 记忆命中却失败，别退回 same-origin
+      return once('include', true).catch(noRangeRetry);
     });
   }
 
@@ -3769,6 +3801,7 @@
       if (!m || m === 'NONE') continue;
       if (m !== 'AES-128') return '不支持的加密方式 ' + m + '（仅支持 AES-128）';
       if (!window.crypto || !crypto.subtle) return '加密流需要在 HTTPS 页面播放（内核限制）';
+      if (keys[j].uri) { try { getKeyBytes(keys[j].uri).catch(function () {}); } catch (e3) {} }  // 首片前先热 KEY
     }
     return '';
   }
@@ -3838,11 +3871,16 @@
     return false;
   }
 
+  // 2 小时流 1800+ 分片，线性扫描在每次 seek / 预取 / 续播都要跑 → 改二分
   function findSegIndex(segs, t) {
-    for (var i = 0; i < segs.length; i++) {
-      if (t < segs[i].start + segs[i].dur) return i;
+    var lo = 0, hi = segs.length - 1;
+    if (hi < 0) return -1;
+    while (lo < hi) {
+      var mid = (lo + hi) >> 1;
+      if (t < segs[mid].start + segs[mid].dur) hi = mid;
+      else lo = mid + 1;
     }
-    return segs.length - 1;
+    return lo;
   }
 
   function HlsPlayer(url, video, onState) {
@@ -3877,6 +3915,7 @@
     this.softSeekT = 0;
     this.softFailed = false;
     this.hardRetried = false;
+    this._pfPending = new Set();   // 并发预取中的分片 key（只拉原始字节）
     this.finished = false;    // 点播分片已经全部处理完
     this.startedAt = 0;       // 实际起播位置（续播/跳片头生效时 > 0）
     this.loadCount = 0;       // MSE 构建次数（诊断/测试：续播应只构建一次）
@@ -3884,7 +3923,9 @@
 
   HlsPlayer.prototype.start = function (at, skip) {
     var self = this;
+    markT('playlistStart');
     return getPlaylist(this.url).then(function (c) {
+      markT('playlistEnd');
       var r = c.r, pl = c.pl;
       if (!pl.segs.length) throw new Error('播放列表为空');
       var encErr = checkCryptoSupport(pl);
@@ -4100,6 +4141,7 @@
 
   HlsPlayer.prototype.load = function (index, seekTime) {
     var self = this;
+    markT('loadStart');
     var gen = ++this.gen;
     this.loadCount++;
 
@@ -4112,6 +4154,7 @@
     this.ctrl = ctrl;
 
     this.restarting = true;
+    this._pfPending = new Set();   // 换 load 作废旧预取集合
     if (playerEl && !playerEl.classList.contains('loading')) playerEl.classList.add('buffering');
     this.pendingSeek = seekTime;
     this.aligned = false;
@@ -4143,6 +4186,7 @@
       var timer = setTimeout(function () { rej(new Error('MediaSource 打开超时')); }, 15000);
       self._openTimer = timer;
       ms.addEventListener('sourceopen', function () {
+        markT('sourceopen');
         clearTimeout(timer);
         if (self._openTimer === timer) self._openTimer = 0;
         res();
@@ -4166,6 +4210,7 @@
       }) : Promise.resolve(null);
 
       return initReadyP.then(function (initBuf) {
+        markT('initReady');
         if (gen !== self.gen) return;
         var sb;
         try { sb = ms.addSourceBuffer(self.mime); } catch (e) { throw new Error('addSourceBuffer 失败'); }
@@ -4281,6 +4326,7 @@
     }
 
     if (b && b.length) {
+      markT('firstBuffered');
       if (this.ptsOffset == null) {
         var first = this.segs[index] ? this.segs[index].start : 0;
         this.ptsOffset = b.start(0) - first;
@@ -4309,6 +4355,7 @@
     }
 
     if (this.autoPlay) {
+      markT('playing');
       this.autoPlay = false;
       if (!userPaused) safePlay(this.video);
     }
@@ -4378,6 +4425,26 @@
     } catch (e) { captureError('sb-trim', e); }
   };
 
+  // 并发预取后续分片的原始字节进 segCache；解密/转封装仍由 fetchSeg 按序做，
+  // 避免 gen 切换或 txmux 未就绪时的竞态。长流下把逐片串行 RTT 折叠成一次窗口。
+  HlsPlayer.prototype.prefetchAhead = function (from, gen, signal) {
+    if (!cfg.segCache || this.dead) return;
+    var self = this, n = this.aligned ? 3 : 2;
+    for (var k = 1; k <= n; k++) {
+      (function (j) {
+        if (j >= self.segs.length || self.segs[j].gap) return;
+        var key = cacheKey(self.segs[j].url, self.segs[j].range);
+        if (segCache.has(key) || self._pfPending.has(key)) return;
+        self._pfPending.add(key);
+        try {
+          fetchBuf(self.segs[j].url, { range: self.segs[j].range, signal: signal }).then(function (b) {
+            if (!self.dead && gen === self.gen && !(signal && signal.aborted)) putSegCache(key, b);
+          }).catch(function () {}).then(function () { self._pfPending.delete(key); });
+        } catch (e) { self._pfPending.delete(key); }
+      })(from + k);
+    }
+  };
+
   HlsPlayer.prototype.pump = function (index, gen, sb, firstP) {
     var self = this;
     var i = index;
@@ -4394,7 +4461,8 @@
         }
         return;
       }
-      if (self.pendingSeek == null && aheadSeconds(self.video) > 60) {
+      var water = self.aligned ? 45 : 20;    // 起播先冲 20s，稳定后维持 45s（原为固定 60s 串行）
+      if (self.pendingSeek == null && aheadSeconds(self.video) > water) {
         setTimeout(step, 300);
         return;
       }
@@ -4403,10 +4471,12 @@
       if (seg.gap) { i++; setTimeout(step, 0); return; }   // 占位分片：不请求，时间轴留着
       var p = (i === index && firstP) ? firstP : self.fetchSeg(seg, i, signal);
       if (i === index) firstP = null;
+      self.prefetchAhead(i, gen, signal);
 
       p.then(function (buf) {
         if (self.dead || gen !== self.gen) return;
         return appendChunk(sb, buf, function () { return !self.dead && gen === self.gen; }).then(function () {
+          markT('firstAppend');
           self.failStreak = 0;
           self.maybeTrim(sb, gen);
           i++;
@@ -5497,7 +5567,10 @@
     try { out.tasks = dlTasks.map(function (t) { return { id: t.id, kind: t.kind, received: t.received || 0 }; }); } catch (e) {}
     try {
       out.hls = hls ? { gen: hls.gen, segs: hls.segs.length, total: hls.total,
-        transmux: hls.transmux, hasDisc: !!hls.hasDisc, discCount: hls.discCount || 0 } : null;
+        transmux: hls.transmux, hasDisc: !!hls.hasDisc, discCount: hls.discCount || 0,
+        variants: (hls.variants || []).length, variantIndex: hls.variantIndex || 0,
+        loadCount: hls.loadCount || 0, startedAt: hls.startedAt || 0,
+        ptsOffset: hls.ptsOffset, pfPending: hls._pfPending ? hls._pfPending.size : 0 } : null;
     } catch (e) {}
     try {
       out.player = { open: !!playerOpen, paused: !!(videoEl && videoEl.paused),
@@ -5506,7 +5579,9 @@
     try { out.errors = errLog.slice(); } catch (e) {}
     try { out.warnings = (window.__xbvkWarnLog || []).slice(); } catch (e) {}
     try { out.pStateChecks = pStateChecks; } catch (e) {}
-    try { out.storage = { segCacheBytes: segCacheBytes, items: items.size, hasOPFS: !!dlDir }; } catch (e) {}
+    try { out.timing = JSON.parse(JSON.stringify(ttff)); } catch (e) {}
+    try { out.storage = { segCacheBytes: segCacheBytes, segCacheCount: segCache.size,
+      segCacheMax: SEG_CACHE_MAX, items: items.size, hasOPFS: !!dlDir }; } catch (e) {}
     return out;
   }
 
@@ -5684,6 +5759,7 @@
       get warnings() { return (window.__xbvkWarnLog || []).slice(); },
       get pStateChecks() { return pStateChecks; },
       get errors() { return errLog.slice(); },
+      get timing() { try { return JSON.parse(JSON.stringify(ttff)); } catch (e) { return {}; } },
       diagnose: function () { return diagnose(); },
       items: function () {
         return sortedItems().map(function (it) {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频提取器 · 万能播放/下载
 // @namespace    local.xbrowser.videokit
-// @version      3.4.2
+// @version      3.4.3
 // @description  自动嗅探网页视频（直链 / m3u8 / MSE 流），自带播放器（倍速、清晰度切换、全片拖动）与站内下载管理（不跳系统下载器，可打开/分享/导出），多线程下载并合并为 mp4。
 // @author       me
 // @match        *://*/*
@@ -22,7 +22,7 @@
   try { IS_TOP = (window.top === window.self); } catch (e) { IS_TOP = false; }
 
   var MAX_ITEMS = 40;
-  var VERSION = '3.4.2';
+  var VERSION = '3.4.3';
 
   var CFG_KEY = 'xbvk.cfg';
   var cfg = {
@@ -2357,8 +2357,19 @@
       } catch (e) {}
     });
 
+    var waitHits = [];
     videoEl.addEventListener('waiting', function () {
       if (playerOpen && !videoEl.paused && playerEl) playerEl.classList.add('buffering');
+      var now = Date.now();
+      waitHits.push(now);
+      while (waitHits.length && now - waitHits[0] > 30000) waitHits.shift();
+      if (hls) hls.waitHits = waitHits.length;
+      if (hls && !hls.waitHinted && waitHits.length >= 3 &&
+          hls.variants && hls.variants.length > 1 &&
+          hls.variantIndex < hls.variants.length - 1) {
+        hls.waitHinted = true;
+        toast('网络跟不上当前清晰度，点右上角「清晰度」降一档会更快');
+      }
     });
     videoEl.addEventListener('canplay', function () {
       if (playerEl && videoEl.readyState >= 3) playerEl.classList.remove('buffering');
@@ -3524,6 +3535,41 @@
     return '默认';
   }
 
+  var QKEY = 'xbvk.qbw', BWKEY = 'xbvk.bw';
+  function readNum(k) { try { return Number(localStorage.getItem(k)) || 0; } catch (e) { return 0; } }
+  function writeNum(k, v) { try { localStorage.setItem(k, String(v)); } catch (e) {} }
+
+  // variants 已按带宽降序。用户手动选过 > 历史实测带宽 > 中低档起步。
+  // 锁死 variants[0] 会让弱网一直拉最高码率分片，缓冲追不上就转圈。
+  function pickStartVariant(variants, savedBw, measuredBw) {
+    var n = variants.length;
+    if (!n) return 0;
+    if (savedBw > 0) {
+      var best = 0, bd = Infinity;
+      for (var j = 0; j < n; j++) {
+        var d = Math.abs((variants[j].bw || 0) - savedBw);
+        if (d < bd) { bd = d; best = j; }
+      }
+      return best;
+    }
+    if (measuredBw > 0) {
+      for (var i = 0; i < n; i++) {
+        if (variants[i].bw && variants[i].bw <= measuredBw * 0.8) return i;
+      }
+      return n - 1;
+    }
+    return Math.min(n - 1, Math.ceil(n / 2));   // 无历史：中低档起步，别一上来最高码率
+  }
+
+  function sampleBw(bytes, ms) {
+    // 太快的请求多半命中 CDN/缓存，算出来会虚高；单片也钳到 20Mbps 防异常值
+    if (!bytes || ms < 80) return;
+    var bps = Math.min(bytes * 8 * 1000 / ms, 20e6);
+    if (!isFinite(bps) || bps <= 0) return;
+    var old = readNum(BWKEY);
+    writeNum(BWKEY, old ? Math.round(old * 0.7 + bps * 0.3) : Math.round(bps));
+  }
+
   function resolvePlaylist(url, depth) {
     depth = depth || 0;
     if (depth > 3) return Promise.reject(new Error('播放列表层级过深'));
@@ -3564,9 +3610,10 @@
         ensureFab();
       }
 
-      return resolvePlaylist(variants[0].url, depth + 1).then(function (r) {
+      var startIdx = pickStartVariant(variants, readNum(QKEY), readNum(BWKEY));
+      return resolvePlaylist(variants[startIdx].url, depth + 1).then(function (r) {
         r.variants = variants;
-        r.codecs = variants[0].codecs || '';
+        r.codecs = variants[startIdx].codecs || '';
         return r;
       });
     });
@@ -3968,6 +4015,7 @@
     if (!v) return Promise.reject(new Error('没有该清晰度'));
     var t = this.video.currentTime || 0;
     this.variantIndex = i;
+    writeNum(QKEY, v.bw || 0);      // 记住手动选择，下次起播直接用
     this.url = v.url;
     return getPlaylist(v.url, 0).then(function (c) {
       var pl = c.pl;
@@ -4273,10 +4321,12 @@
     var myGen = this.gen;
     var key = cacheKey(seg.url, seg.range);
     var hit = segCache.get(key);
-    if (hit) hit.ts = Date.now();   // LRU：刚用过的分片不该先被淘汰
+    if (hit) { segCache.delete(key); segCache.set(key, hit); }   // 刷新 LRU 顺序
+    var t0 = Date.now();
     var p = hit
       ? Promise.resolve(hit.buf)
       : fetchBuf(seg.url, { range: seg.range, signal: signal }).then(function (buf) {
+          sampleBw(buf.byteLength, Date.now() - t0);
           putSegCache(key, buf);
           return buf;
         });
@@ -5570,7 +5620,9 @@
         transmux: hls.transmux, hasDisc: !!hls.hasDisc, discCount: hls.discCount || 0,
         variants: (hls.variants || []).length, variantIndex: hls.variantIndex || 0,
         loadCount: hls.loadCount || 0, startedAt: hls.startedAt || 0,
-        ptsOffset: hls.ptsOffset, pfPending: hls._pfPending ? hls._pfPending.size : 0 } : null;
+        ptsOffset: hls.ptsOffset, pfPending: hls._pfPending ? hls._pfPending.size : 0,
+        variantBw: (hls.variants && hls.variants[hls.variantIndex || 0] || {}).bw || 0,
+        measuredBw: readNum(BWKEY), waitHits: hls.waitHits || 0 } : null;
     } catch (e) {}
     try {
       out.player = { open: !!playerOpen, paused: !!(videoEl && videoEl.paused),

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频提取器 · 万能播放/下载
 // @namespace    local.xbrowser.videokit
-// @version      3.4.3
+// @version      3.4.4
 // @description  自动嗅探网页视频（直链 / m3u8 / MSE 流），自带播放器（倍速、清晰度切换、全片拖动）与站内下载管理（不跳系统下载器，可打开/分享/导出），多线程下载并合并为 mp4。
 // @author       me
 // @match        *://*/*
@@ -22,7 +22,7 @@
   try { IS_TOP = (window.top === window.self); } catch (e) { IS_TOP = false; }
 
   var MAX_ITEMS = 40;
-  var VERSION = '3.4.3';
+  var VERSION = '3.4.4';
 
   var CFG_KEY = 'xbvk.cfg';
   var cfg = {
@@ -3047,6 +3047,11 @@
 
   function openPlayer(title, rect) {
     buildUI();
+    try {
+      var oldTracks = videoEl.querySelectorAll('track');
+      for (var ti = 0; ti < oldTracks.length; ti++) oldTracks[ti].remove();
+    } catch (e) {}
+    if (rect && rect.source) migrateTracks(rect.source);
     try { resetStageGesture(); } catch (e) {}
     playerOpen = true;
     resetSeekUI();
@@ -3221,6 +3226,8 @@
   function migrateTracks(v) {
     if (!v || !videoEl) return;
     try {
+      var old = videoEl.querySelectorAll('track');
+      for (var k = 0; k < old.length; k++) old[k].remove();
       var ts = v.querySelectorAll('track');
       for (var i = 0; i < ts.length; i++) videoEl.appendChild(ts[i].cloneNode(true));
       var vtt = v.textTracks, ntt = videoEl.textTracks;
@@ -3247,7 +3254,6 @@
 
     markTakeover(v);
     siteVideo = v;
-    migrateTracks(v);
     try { siteWasPlaying = !v.paused; v.pause(); } catch (e) {}
     playItem(it, { left: r.left, top: r.top, width: r.width, height: r.height, source: v });
   }
@@ -3304,7 +3310,6 @@
 
     markTakeover(best);
     siteVideo = best;
-    migrateTracks(best);
     try { siteWasPlaying = !best.paused; best.pause(); } catch (e) {}
     playItem(it, {
       left: bestRect.left, top: bestRect.top,
@@ -3568,6 +3573,30 @@
     if (!isFinite(bps) || bps <= 0) return;
     var old = readNum(BWKEY);
     writeNum(BWKEY, old ? Math.round(old * 0.7 + bps * 0.3) : Math.round(bps));
+  }
+
+  // 活跃下载窗口统计：把并发预取与主拉取合并算总吞吐，既不漏采样预取分片，也不因并发分流低估带宽
+  var bwWin = { active: 0, start: 0, bytes: 0, done: 0 };
+  function bwBegin(now) {
+    now = now || Date.now();
+    if (bwWin.active === 0) { bwWin.start = now; bwWin.bytes = 0; bwWin.done = 0; }
+    bwWin.active++;
+  }
+  function bwEnd(bytes, now) {
+    now = now || Date.now();
+    if (bwWin.active > 0) bwWin.active--;
+    if (bytes > 0) { bwWin.bytes += bytes; bwWin.done++; }
+    var dt = now - bwWin.start;
+    var flush = bwWin.active === 0 || (dt >= 5000 && bwWin.done >= 3) || dt >= 15000;
+    if (flush && bwWin.bytes > 0) {
+      sampleBw(bwWin.bytes, dt);
+      bwWin.start = now;
+      bwWin.bytes = 0;
+      bwWin.done = 0;
+    } else if (bwWin.active === 0) {
+      bwWin.bytes = 0;
+      bwWin.done = 0;
+    }
   }
 
   function resolvePlaylist(url, depth) {
@@ -4013,7 +4042,7 @@
     var vs = this.variants || [];
     var v = vs[i];
     if (!v) return Promise.reject(new Error('没有该清晰度'));
-    var t = this.video.currentTime || 0;
+    var t = Math.max(0, (this.video.currentTime || 0) - (this.ptsOffset || 0));
     this.variantIndex = i;
     writeNum(QKEY, v.bw || 0);      // 记住手动选择，下次起播直接用
     this.url = v.url;
@@ -4322,13 +4351,16 @@
     var key = cacheKey(seg.url, seg.range);
     var hit = segCache.get(key);
     if (hit) { segCache.delete(key); segCache.set(key, hit); }   // 刷新 LRU 顺序
-    var t0 = Date.now();
+    if (!hit) bwBegin();
     var p = hit
       ? Promise.resolve(hit.buf)
       : fetchBuf(seg.url, { range: seg.range, signal: signal }).then(function (buf) {
-          sampleBw(buf.byteLength, Date.now() - t0);
+          bwEnd(buf.byteLength);
           putSegCache(key, buf);
           return buf;
+        }, function (err) {
+          bwEnd(0);
+          throw err;
         });
     return p.then(function (buf) {
       var kp = (seg.key && seg.key.method === 'AES-128')
@@ -4486,11 +4518,15 @@
         var key = cacheKey(self.segs[j].url, self.segs[j].range);
         if (segCache.has(key) || self._pfPending.has(key)) return;
         self._pfPending.add(key);
+        bwBegin();
         try {
           fetchBuf(self.segs[j].url, { range: self.segs[j].range, signal: signal }).then(function (b) {
+            bwEnd(b && b.byteLength ? b.byteLength : 0);
             if (!self.dead && gen === self.gen && !(signal && signal.aborted)) putSegCache(key, b);
-          }).catch(function () {}).then(function () { self._pfPending.delete(key); });
-        } catch (e) { self._pfPending.delete(key); }
+          }, function () {
+            bwEnd(0);
+          }).then(function () { self._pfPending.delete(key); });
+        } catch (e) { bwEnd(0); self._pfPending.delete(key); }
       })(from + k);
     }
   };
@@ -5319,7 +5355,9 @@
           failed++;
           streak++;
           var limit = Math.max(3, Math.ceil(tasks.length * 0.15));
-          if (streak >= 8 || failed > limit) throw new Error('分片连续失败，已中止');
+          if (!task || streak >= 8 || failed > limit) {
+            throw new Error(task ? '分片连续失败，已中止' : '分片下载失败，已中止');
+          }
           return null;
         }
         return sleep(400 * (attempt + 1)).then(function () { return grab(t, attempt + 1); });
@@ -5455,10 +5493,10 @@
       }
       return srcP.then(function (rs) {
         var parts = rs.filter(function (x) { return x; });
-        if (parts.length !== tasks.length) throw new Error('有 ' + (tasks.length - parts.length) + ' 个分片缺失，已保留进度可重试');
+        if (parts.length !== tasks.length) throw new Error('有 ' + (tasks.length - parts.length) + ' 个分片缺失');
         var totalBytes = 0;
         for (var i = 0; i < parts.length; i++) totalBytes += parts[i].size || 0;
-        var tail = (failed ? '，' + failed + ' 个分片失败' : '') + (pl.endlist ? '' : '，直播流仅当前片段');
+        var tail = pl.endlist ? '' : '，直播流仅当前片段';
         if (pl.hasDisc) {
           // 多个不同 init 段/时间戳基准的 fMP4 拼成一个 MP4 必然错乱，宁可明确拒绝也别产出坏文件
           if (pl.map) throw new Error('该流含 ' + (pl.discCount || 1) + ' 处拼接段，fMP4 合并会时间轴错乱；请用「录制当前画面」');
@@ -5637,6 +5675,12 @@
     return out;
   }
 
+  function parseRemoteVersion(t) {
+    if (!t) return '';
+    var m = /@version[ \t]+([^\s]+)/.exec(t);
+    return m ? m[1] : '';
+  }
+
   // 每天最多检查一次线上版本；跨域失败/CSP 拦截一律静默，不打扰用户
   function checkUpdate() {
     try {
@@ -5649,12 +5693,7 @@
         return (r && r.ok) ? r.text() : '';
       }).then(function (t) {
         if (!t) return;
-        var idx = t.indexOf('@version');
-        if (idx < 0) return;
-        var nl = String.fromCharCode(10);
-        var eol = t.indexOf(nl, idx);
-        var line = t.slice(idx, eol > 0 ? eol : idx + 40).trim().split(' ');
-        var rv = line[1] || '';
+        var rv = parseRemoteVersion(t);
         function newer(a, b) {
           var x = a.split('.').map(Number), y = b.split('.').map(Number);
           for (var q = 0; q < 3; q++) {

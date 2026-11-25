@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频提取器 · 万能播放/下载
 // @namespace    local.xbrowser.videokit
-// @version      3.4.4
+// @version      3.5.0
 // @description  自动嗅探网页视频（直链 / m3u8 / MSE 流），自带播放器（倍速、清晰度切换、全片拖动）与站内下载管理（不跳系统下载器，可打开/分享/导出），多线程下载并合并为 mp4。
 // @author       me
 // @match        *://*/*
@@ -22,7 +22,7 @@
   try { IS_TOP = (window.top === window.self); } catch (e) { IS_TOP = false; }
 
   var MAX_ITEMS = 40;
-  var VERSION = '3.4.4';
+  var VERSION = '3.5.0';
 
   var CFG_KEY = 'xbvk.cfg';
   var cfg = {
@@ -520,18 +520,27 @@
     return out;
   }
 
+  var lastDomCount = -1;
   function scanDom() {
     var vids = collectVideos(document);
     if (vids.length) {
       hasVideoEl = true;
       if (IS_TOP) ensureFab();
     }
-    if (deepScanTick++ % 8 === 0) {       // 声明式 Shadow DOM 不触发 attachShadow，必须无条件定期扫
+    // 声明式 Shadow DOM 不触发 attachShadow，首轮必扫；之后仅在已检测到 Shadow DOM
+    // 或页面节点数变化时低频深扫，避免静态长页每 12s 全表 querySelectorAll('*') 掉帧
+    var tick = deepScanTick++;
+    var domCount = -1;
+    try { domCount = document.getElementsByTagName('*').length; } catch (e) {}
+    var needDeep = tick === 0 || ((hasShadow || domCount !== lastDomCount) && tick % 12 === 0);
+    if (needDeep) {
+      lastDomCount = domCount;
       try {
         var all = document.querySelectorAll('*');
         for (var i = 0; i < all.length && i < 3000; i++) {
           var sr = all[i].shadowRoot;
           if (!sr) continue;
+          hasShadow = true;
           collectVideos(sr, vids);
           var nested = sr.querySelectorAll('*');
           for (var q = 0; q < nested.length && q < 1000; q++) {
@@ -551,21 +560,32 @@
         }
       } catch (e) {}
     }
-    if (vids.length && IS_TOP) scheduleAutoTakeover();
 
+    var hasFrameVideo = false;
     try {
       var ifs = document.querySelectorAll('iframe');
       for (var n = 0; n < ifs.length; n++) {
         var doc = null;
         try { doc = ifs[n].contentDocument; } catch (e) { doc = null; }
         if (!doc) continue;
+        if (IS_TOP) bindFramePlay(doc);
         var iv = collectVideos(doc);
+        if (iv.length) hasFrameVideo = true;
         for (var m = 0; m < iv.length; m++) {
           if (iv[m].currentSrc) onMediaUrl(iv[m], iv[m].currentSrc, 'dom');
           if (iv[m].src) onMediaUrl(iv[m], iv[m].src, 'dom');
+          var iss = iv[m].querySelectorAll('source');
+          for (var jj = 0; jj < iss.length; jj++) {
+            if (iss[jj].src) onMediaUrl(iss[jj], iss[jj].src, 'dom');
+          }
         }
       }
     } catch (e) {}
+    if (hasFrameVideo) {
+      hasVideoEl = true;
+      if (IS_TOP) ensureFab();
+    }
+    if ((vids.length || hasFrameVideo) && IS_TOP) scheduleAutoTakeover();
   }
 
   /* ------------------------------------------------------------------ *
@@ -2753,6 +2773,21 @@
     return s;
   }
 
+  var dlEstKey = '';
+  function placeChildAt(parent, node, idx) {
+    var ref = parent.children[idx] || null;
+    if (node !== ref) parent.insertBefore(node, ref);
+  }
+
+  function taskProgText(tk) {
+    if (tk.kind === 'hls') {
+      var had = 0;
+      for (var i = 0; i < (tk.done || []).length; i++) { if (tk.done[i]) had++; }
+      return '未完成 · 已下 ' + had + '/' + (tk.segs ? tk.segs.length : '?') + ' 段';
+    }
+    return '未完成 · 已下 ' + fmtBytes(tk.received || 0) + (tk.total ? ' / ' + fmtBytes(tk.total) : '');
+  }
+
   function renderDownloads() {
     if (!dlistEl) return;
     var n = dlMan.files.length;
@@ -2767,53 +2802,113 @@
     try {
       requestAnimationFrame(function () { try { dlistEl.scrollTop = keepTop; } catch (e2) {} });
     } catch (e) {}
-    dlistEl.innerHTML = '';
 
-    var use = document.createElement('div');
-    use.className = 'dluse';
-    use.innerHTML = '<b>' + (dlDir ? '本站已用 ' + fmtBytes(dlManBytes()) : '内存暂存，退出页面即失效') +
-      '</b><span class="sp"></span>' + (n ? '<button data-act="clearall">清空</button>' : '');
-    dlistEl.appendChild(use);
-    if (dlDir && navigator.storage && navigator.storage.estimate) {
-      navigator.storage.estimate().then(function (es) {
-        var b = use.querySelector('b');
-        if (b && es) b.textContent = '本站已用 ' + fmtBytes(es.usage || 0) + (es.quota ? ' / 配额约 ' + fmtBytes(es.quota) : '');
-      }).catch(function () {});
+    // keyed diff：复用顶栏、任务卡与文件卡，下载刷新不闪屏、不打断点击
+    var bytes = dlManBytes();
+    var use = dlistEl.querySelector('.dluse');
+    if (!use) {
+      use = document.createElement('div');
+      use.className = 'dluse';
+      use.innerHTML = '<b></b><span class="sp"></span>';
+    }
+    var useB = use.querySelector('b');
+    var estKey = (dlDir ? '1' : '0') + '|' + n + '|' + bytes + '|' + dlTasks.length;
+    if (useB && (!useB.textContent || dlEstKey !== estKey)) {
+      useB.textContent = dlDir ? '本站已用 ' + fmtBytes(bytes) : '内存暂存，退出页面即失效';
+    }
+    var clrBtn = use.querySelector('[data-act="clearall"]');
+    if (n && !clrBtn) {
+      clrBtn = document.createElement('button');
+      clrBtn.setAttribute('data-act', 'clearall');
+      clrBtn.textContent = '清空';
+      use.appendChild(clrBtn);
+    } else if (!n && clrBtn) {
+      try { clrBtn.remove(); } catch (e3) {}
     }
 
+    var pos = 0;
+    placeChildAt(dlistEl, use, pos++);
+
+    if (dlDir && dlEstKey !== estKey && navigator.storage && navigator.storage.estimate) {
+      dlEstKey = estKey;
+      navigator.storage.estimate().then(function (es) {
+        var b = use.querySelector('b');
+        if (b && es && dlEstKey === estKey) {
+          b.textContent = '本站已用 ' + fmtBytes(es.usage || 0) + (es.quota ? ' / 配额约 ' + fmtBytes(es.quota) : '');
+        }
+      }).catch(function () {});
+    } else {
+      dlEstKey = estKey;
+    }
+
+    var run = dlistEl.querySelector('.dlrun');
     if (dlActive > 0) {
-      var run = document.createElement('div');
-      run.className = 'dlrun';
-      run.innerHTML = '<b>⬇</b>有下载任务进行中，进度见悬浮进度卡';
-      dlistEl.appendChild(run);
+      if (!run) {
+        run = document.createElement('div');
+        run.className = 'dlrun';
+        run.innerHTML = '<b>⬇</b>有下载任务进行中，进度见悬浮进度卡';
+      }
+      placeChildAt(dlistEl, run, pos++);
+    } else if (run) {
+      try { run.remove(); } catch (e4) {}
+    }
+
+    var oldTasks = new Map();
+    var oldFiles = new Map();
+    var kids = dlistEl.children;
+    for (var k = 0; k < kids.length; k++) {
+      var el = kids[k];
+      if (!el.classList) continue;
+      if (el.classList.contains('dtask')) oldTasks.set(el.getAttribute('data-tid'), el);
+      else if (el.classList.contains('dit')) oldFiles.set(el.getAttribute('data-id'), el);
     }
 
     // 未完成任务（断点续传）
-    for (var ti = 0; ti < dlTasks.length; ti++) dlistEl.appendChild(taskRow(dlTasks[ti]));
+    for (var ti = 0; ti < dlTasks.length; ti++) {
+      var tk = dlTasks[ti], tkey = String(tk.id);
+      var prog = taskProgText(tk);
+      var tsig = tkey + '|' + tk.name + '|' + prog;
+      var trow = oldTasks.get(tkey);
+      if (!trow || trow.getAttribute('data-sig') !== tsig) {
+        trow = taskRow(tk, prog);
+        trow.setAttribute('data-sig', tsig);
+      }
+      placeChildAt(dlistEl, trow, pos++);
+      oldTasks.delete(tkey);
+    }
+    oldTasks.forEach(function (el) { try { el.remove(); } catch (e5) {} });
 
+    var empty = dlistEl.querySelector('.empty');
     if (!n && !dlTasks.length) {
-      var d = document.createElement('div');
-      d.className = 'empty';
-      d.innerHTML = '<svg viewBox="0 0 24 24" width="36" height="36" fill="none" stroke="#565e6b" stroke-width="1.5">' +
-        '<path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2.6A1.4 1.4 0 0 0 5.4 21h13.2a1.4 1.4 0 0 0 1.4-1.4V17"/></svg>' +
-        '<b>还没有下载的文件</b><br>在「视频」页签点下载，存完在这里打开 / 导出';
-      dlistEl.appendChild(d);
+      oldFiles.forEach(function (el) { try { el.remove(); } catch (e6) {} });
+      if (!empty) {
+        empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.innerHTML = '<svg viewBox="0 0 24 24" width="36" height="36" fill="none" stroke="#565e6b" stroke-width="1.5">' +
+          '<path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2.6A1.4 1.4 0 0 0 5.4 21h13.2a1.4 1.4 0 0 0 1.4-1.4V17"/></svg>' +
+          '<b>还没有下载的文件</b><br>在「视频」页签点下载，存完在这里打开 / 导出';
+      }
+      placeChildAt(dlistEl, empty, pos++);
       return;
     }
-    if (!n) return;
+    if (empty) { try { empty.remove(); } catch (e7) {} }
 
-    for (var i = 0; i < n; i++) dlistEl.appendChild(dlRow(dlMan.files[i]));
+    for (var i = 0; i < n; i++) {
+      var f = dlMan.files[i], fkey = String(f.id);
+      var fsig = fkey + '|' + f.size + '|' + f.name + '|' + f.ts;
+      var frow = oldFiles.get(fkey);
+      if (!frow || frow.getAttribute('data-sig') !== fsig) {
+        frow = dlRow(f);
+        frow.setAttribute('data-sig', fsig);
+      }
+      placeChildAt(dlistEl, frow, pos++);
+      oldFiles.delete(fkey);
+    }
+    oldFiles.forEach(function (el) { try { el.remove(); } catch (e8) {} });
   }
 
-  function taskRow(tk) {
-    var prog;
-    if (tk.kind === 'hls') {
-      var had = 0;
-      for (var i = 0; i < (tk.done || []).length; i++) { if (tk.done[i]) had++; }
-      prog = '未完成 · 已下 ' + had + '/' + (tk.segs ? tk.segs.length : '?') + ' 段';
-    } else {
-      prog = '未完成 · 已下 ' + fmtBytes(tk.received || 0) + (tk.total ? ' / ' + fmtBytes(tk.total) : '');
-    }
+  function taskRow(tk, prog) {
+    prog = prog || taskProgText(tk);
     var row = document.createElement('div');
     row.className = 'dit dtask';
     row.setAttribute('data-tid', tk.id);
@@ -3011,6 +3106,33 @@
   /* ------------------------------------------------------------------ *
    *  播放器
    * ------------------------------------------------------------------ */
+  // 把顶层或同域嵌套 iframe 里的 <video> 位置统一换算并裁剪到顶层视口坐标
+  function videoViewportRect(v) {
+    if (!v) return null;
+    if (!v.getBoundingClientRect) return v;
+    var r;
+    try { r = v.getBoundingClientRect(); } catch (e) { return null; }
+    if (!r) return null;
+    var left = r.left, top = r.top, width = r.width, height = r.height;
+    try {
+      var win = v.ownerDocument && v.ownerDocument.defaultView;
+      var guard = 0;
+      while (win && win !== window && guard++ < 6) {
+        var fe = win.frameElement;
+        if (!fe || !fe.getBoundingClientRect) return null;
+        var fr = fe.getBoundingClientRect();
+        var cl = Math.max(0, left), ct = Math.max(0, top);
+        var cr = Math.min(fr.width, left + width), cb = Math.min(fr.height, top + height);
+        left = fr.left + cl;
+        top = fr.top + ct;
+        width = Math.max(0, cr - cl);
+        height = Math.max(0, cb - ct);
+        win = win.parent;
+      }
+    } catch (e) { return null; }
+    return { left: left, top: top, width: width, height: height, right: left + width, bottom: top + height };
+  }
+
   function embedRect(r) {
     var vw = window.innerWidth || 0, vh = window.innerHeight || 0;
     var L = Math.max(0, Math.min(r.left, Math.max(0, vw - 120)));
@@ -3023,10 +3145,21 @@
     };
   }
 
+  var embedFrameWin = null;
+  function unbindEmbedScroll() {
+    try {
+      window.removeEventListener('scroll', syncEmbed, true);
+      window.removeEventListener('resize', syncEmbed);
+      if (embedFrameWin && embedFrameWin !== window) {
+        embedFrameWin.removeEventListener('scroll', syncEmbed, true);
+      }
+    } catch (e) {}
+    embedFrameWin = null;
+  }
+
   function applyEmbed(src) {
     if (!src) return false;
-    var r;
-    try { r = src.getBoundingClientRect ? src.getBoundingClientRect() : src; } catch (e) { return false; }
+    var r = videoViewportRect(src);
     if (!r || r.width < 40 || r.height < 30) return false;
     var er = embedRect(r);
     playerEl.classList.add('embed');
@@ -3038,10 +3171,16 @@
     playerEl.style.right = 'auto';
     playerEl.style.bottom = 'auto';
     embedTarget = src.getBoundingClientRect ? src : null;
-    window.removeEventListener('scroll', syncEmbed, true);
-    window.removeEventListener('resize', syncEmbed);
+    unbindEmbedScroll();
     window.addEventListener('scroll', syncEmbed, { passive: true, capture: true });
     window.addEventListener('resize', syncEmbed);
+    try {
+      var fw = embedTarget && embedTarget.ownerDocument && embedTarget.ownerDocument.defaultView;
+      if (fw && fw !== window) {
+        embedFrameWin = fw;
+        fw.addEventListener('scroll', syncEmbed, { passive: true, capture: true });
+      }
+    } catch (e) {}
     return true;
   }
 
@@ -3108,8 +3247,8 @@
       requestAnimationFrame(function () {
         embedSyncPend = false;
         try {
-          var r = embedTarget.getBoundingClientRect();
-          if (r.width < 40 || r.height < 30) return;
+          var r = videoViewportRect(embedTarget);
+          if (!r || r.width < 40 || r.height < 30) return;
           var er = embedRect(r);
           playerEl.classList.toggle('mini', er.width < 340 || er.height < 200);
           playerEl.style.left = er.left + 'px';
@@ -3153,10 +3292,7 @@
     playerEl.classList.remove('mini');
     playerEl.style.cssText = '';
     embedTarget = null;
-    try {
-      window.removeEventListener('scroll', syncEmbed, true);
-      window.removeEventListener('resize', syncEmbed);
-    } catch (e) {}
+    unbindEmbedScroll();
     restoreSiteVideo();
     for (var ri = 0; ri < dlObjUrls.length; ri++) { try { URL.revokeObjectURL(dlObjUrls[ri]); } catch (e) {} }
     dlObjUrls.length = 0;
@@ -3239,14 +3375,46 @@
     } catch (e) {}
   }
 
+  var framePlayBound = (typeof WeakSet === 'function') ? new WeakSet() : null;
+  function bindFramePlay(doc) {
+    if (!doc || doc === document || !IS_TOP) return;
+    try {
+      if (framePlayBound) {
+        if (framePlayBound.has(doc)) return;
+        framePlayBound.add(doc);
+      } else {
+        if (doc.__xbvk_pb) return;
+        doc.__xbvk_pb = 1;
+      }
+      doc.addEventListener('play', function (e) {
+        var v = e.target;
+        if (v && v.tagName === 'VIDEO') tryTakeover(v);
+      }, true);
+    } catch (e) {}
+  }
+
+  function collectAllVideos() {
+    var out = collectVideos(document);
+    try {
+      var ifs = document.querySelectorAll('iframe');
+      for (var i = 0; i < ifs.length; i++) {
+        var doc = null;
+        try { doc = ifs[i].contentDocument; } catch (e) { doc = null; }
+        if (!doc) continue;
+        bindFramePlay(doc);
+        collectVideos(doc, out);
+      }
+    } catch (e) {}
+    return out;
+  }
+
   function tryTakeover(v) {
     allowRetake(v);
     if (takeoverTried || playerOpen || !IS_TOP) return;
     if (!v || v === videoEl || v.tagName !== 'VIDEO') return;
     if (v.videoWidth && v.videoWidth < 200) return;        // 小窗/贴片广告不接管
 
-    var r;
-    try { r = v.getBoundingClientRect(); } catch (e) { return; }
+    var r = videoViewportRect(v);
     if (!r || r.width < 160 || r.height < 90) return;      // 太小的播放框不动
 
     var it = pickPlayable(v);
@@ -3286,15 +3454,14 @@
   function autoTakeoverNow() {
     if (playerOpen || !IS_TOP) return;
 
-    var vids = collectVideos(document);
+    var vids = collectAllVideos();
     var best = null, bestArea = 0, bestRect = null;
     for (var i = 0; i < vids.length; i++) {
       var v = vids[i];
       if (v === videoEl) continue;
       // 背景/装饰视频（循环播放、静音且无控件）不是用户要看的正片
       if (v.loop || (v.muted && !v.controls)) continue;
-      var r;
-      try { r = v.getBoundingClientRect(); } catch (e) { continue; }
+      var r = videoViewportRect(v);
       if (!r || r.width < 260 || r.height < 140) continue;              // 小窗不动
       if (r.bottom < 60 || r.top > window.innerHeight - 60) continue;    // 必须在可视区
       var area = r.width * r.height;
@@ -5055,6 +5222,33 @@
     return (e && e.message) ? ('写入失败：' + e.message) : '写入下载管理失败，请重试';
   }
 
+  // 直链下载复用 HLS 的 origin 凭据记忆：跨域需 Cookie 的站点自动切 include，避免直接失败退系统下载
+  function dlFetch(url, opt) {
+    opt = opt || {};
+    var origin = originOf(url);
+    var firstCred = credPolicy.get(origin) || 'same-origin';
+    function once(cred) {
+      var init = { credentials: cred };
+      if (opt.signal) init.signal = opt.signal;
+      if (opt.headers) init.headers = opt.headers;
+      return netFetch(url, init).then(function (r) {
+        if (r.ok || r.status === 206) {
+          try { credPolicy.set(origin, cred); } catch (e0) {}
+        }
+        return r;
+      });
+    }
+    return once(firstCred).then(function (r) {
+      if ((r.status === 401 || r.status === 403) && firstCred !== 'include') {
+        return once('include');
+      }
+      return r;
+    }, function (e) {
+      if ((e && e.name === 'AbortError') || firstCred === 'include') throw e;
+      return once('include');
+    });
+  }
+
   function downloadItem(it, resumeTask) {
     if (!it) return;
     var name = it.title || 'video';
@@ -5086,7 +5280,7 @@
       var taskMode = !!partsDir;      // 只有 OPFS 模式支持续传
 
       function fullGet() {
-        return netFetch(it.url, { credentials: 'same-origin', signal: ctrl.signal }).then(function (r2) {
+        return dlFetch(it.url, { signal: ctrl.signal }).then(function (r2) {
           if (!r2.ok) throw new Error('HTTP ' + r2.status);
           return { r: r2, append: false };
         });
@@ -5094,8 +5288,8 @@
       var fetchP;
       if (taskMode && task && offset0 > 0) {
         // 断点续传：从已下位置接着拉
-        fetchP = netFetch(it.url, {
-          credentials: 'same-origin', signal: ctrl.signal,
+        fetchP = dlFetch(it.url, {
+          signal: ctrl.signal,
           headers: { Range: 'bytes=' + offset0 + '-' }
         }).then(function (r) {
           if (r.status === 206) {
@@ -5111,10 +5305,7 @@
           return fullGet();
         });
       } else {
-        fetchP = netFetch(it.url, { credentials: 'same-origin', signal: ctrl.signal }).then(function (r) {
-          if (!r.ok) throw new Error('HTTP ' + r.status);
-          return { r: r, append: false };
-        });
+        fetchP = fullGet();
       }
 
       return fetchP.then(function (res) {
@@ -5278,52 +5469,130 @@
     return Promise.resolve(x);   // 已经是 ArrayBuffer
   }
 
-  function remuxToMp4(parts, onProgress) {
+  // opt.onChunk：流式输出回调（传入则不攒全量 blobs，直接写盘，大文件峰值内存降至单批数 MB）；
+  // opt.readPart + opt.count：按需读 OPFS 分片，避免一次性打开上千个文件句柄；
+  // 超时改为无进度空闲超时（默认 30s），低端机转大视频不再被固定 60s 误杀。
+  function remuxToMp4(parts, onProgress, opt) {
+    opt = opt || {};
+    var onChunk = typeof opt.onChunk === 'function' ? opt.onChunk : null;
+    var readPartFn = typeof opt.readPart === 'function' ? opt.readPart : null;
+    var totalCount = readPartFn ? (opt.count || 0) : (parts ? parts.length : 0);
+    var idleMs = opt.idleMs || 30000;
     return loadMux().then(function (muxjs) {
       return new Promise(function (res, rej) {
         var t = new muxjs.mp4.Transmuxer();
-        var init = null, blobs = [];
-        var idx = 0, settled = false, tries = 0;
+        var init = null, initSent = false, blobs = [], batchOut = [];
+        var idx = 0, settled = false, tries = 0, inBytes = 0, outBytes = 0, idleTimer = 0;
+
+        function clearIdle() { if (idleTimer) { clearTimeout(idleTimer); idleTimer = 0; } }
+        function bumpIdle() {
+          clearIdle();
+          if (settled) return;
+          idleTimer = setTimeout(function () { finish(false, new Error('转封装超时')); }, idleMs);
+        }
 
         function finish(ok, val) {
           if (settled) return;
           settled = true;
+          clearIdle();
           if (ok) res(val); else rej(val);
         }
 
         t.on('data', function (seg) {
-          if (!init && seg.initSegment && seg.initSegment.byteLength) init = seg.initSegment;
-          if (seg.data && seg.data.byteLength) blobs.push(new Blob([seg.data]));
+          if (!init && seg.initSegment && seg.initSegment.byteLength) {
+            init = seg.initSegment;
+            if (onChunk && !initSent) { initSent = true; batchOut.push(init); }
+          }
+          if (seg.data && seg.data.byteLength) {
+            if (onChunk) batchOut.push(seg.data);
+            else blobs.push(new Blob([seg.data]));
+          }
         });
+
+        function flushOut() {
+          if (!onChunk || !batchOut.length) return Promise.resolve();
+          var list = batchOut.splice(0, batchOut.length);
+          var p = Promise.resolve();
+          for (var j = 0; j < list.length; j++) {
+            (function (u8) {
+              p = p.then(function () {
+                if (settled) return;
+                outBytes += u8.byteLength || 0;
+                return onChunk(u8);
+              });
+            })(list[j]);
+          }
+          return p;
+        }
 
         function complete() {
           if (settled) return;
-          if ((!init || !blobs.length) && tries++ < 20) { setTimeout(complete, 25); return; }
-          if (!init || !blobs.length) { finish(false, new Error('转封装失败')); return; }
-          finish(true, new Blob([init].concat(blobs), { type: 'video/mp4' }));
+          flushOut().then(function () {
+            if (settled) return;
+            var hasOut = onChunk ? (initSent && outBytes > (init ? init.byteLength : 0)) : (!!init && blobs.length > 0);
+            if (!hasOut && tries++ < 20) { setTimeout(complete, 25); return; }
+            if (!hasOut) { finish(false, new Error('转封装失败')); return; }
+            if (onChunk) finish(true, { inBytes: inBytes, outBytes: outBytes });
+            else finish(true, new Blob([init].concat(blobs), { type: 'video/mp4' }));
+          }, function (e) { finish(false, e); });
         }
 
         function chunk() {
           if (settled) return;
-          var end = Math.min(idx + 4, parts.length);
+          bumpIdle();
+          var end = Math.min(idx + 4, totalCount);
           var batch = [];
-          for (; idx < end; idx++) batch.push(parts[idx]);
+          for (; idx < end; idx++) {
+            batch.push(readPartFn ? readPartFn(idx).then(blobToBuffer) : blobToBuffer(parts[idx]));
+          }
 
-          Promise.all(batch.map(blobToBuffer)).then(function (bufs) {
+          Promise.all(batch).then(function (bufs) {
             if (settled) return;
             for (var k = 0; k < bufs.length; k++) {
+              if (!bufs[k]) { finish(false, new Error('分片读取失败')); return; }
+              inBytes += bufs[k].byteLength || 0;
               try {
                 t.push(new Uint8Array(bufs[k]));
                 t.flush();
               } catch (e) { finish(false, e); return; }
             }
-            if (onProgress) onProgress(idx, parts.length);
-            if (idx < parts.length) setTimeout(chunk, 0);
-            else setTimeout(complete, 0);
+            return flushOut().then(function () {
+              if (settled) return;
+              bumpIdle();
+              if (onProgress) onProgress(idx, totalCount);
+              if (idx < totalCount) setTimeout(chunk, 0);
+              else setTimeout(complete, 0);
+            });
           }).catch(function (e) { finish(false, e); });
         }
+        bumpIdle();
         chunk();
-        setTimeout(function () { finish(false, new Error('转封装超时')); }, 60000);
+      });
+    });
+  }
+
+  // 逐片流式拼接到 OPFS（无 OPFS 时 dlBegin 自动降级内存数组），大文件合并峰值内存仅单片大小
+  function streamConcatToDl(count, readOne, fname, mime, onProgress) {
+    return dlInit().then(function () {
+      return dlBegin(fname, mime);
+    }).then(function (bt) {
+      var idx = 0, totalBytes = 0;
+      function next() {
+        if (idx >= count) {
+          return bt.close().then(function () { return bt.finish(); }).then(function (ent) {
+            return { entry: ent, bytes: totalBytes };
+          });
+        }
+        var cur = idx++;
+        return readOne(cur).then(function (blob) {
+          if (!blob) throw new Error('分片读取失败');
+          totalBytes += blob.size || blob.byteLength || 0;
+          if (onProgress) onProgress(idx, count);
+          return bt.write(blob);
+        }).then(next);
+      }
+      return next().catch(function (e) {
+        return bt.fail().then(function () { throw e; });
       });
     });
   }
@@ -5476,64 +5745,97 @@
       for (var w = 0; w < n; w++) ws.push(worker());
       return Promise.all(ws);
     }).then(function () {
-      // 分片来源：续传模式从盘上读回；内存模式用 results
-      var srcP;
-      if (task) {
-        var fl = [];
-        for (var k = 0; k < tasks.length; k++) {
-          if (tasks[k].isMap || task.done[k]) {
-            fl.push(readPart(task.id, k).catch(function () { return null; }));
-          } else {
-            fl.push(Promise.resolve(null));
-          }
+      // 先核验完整性再合并，不一次性把上千个 OPFS 分片全读入内存
+      var parts = [];
+      for (var k = 0; k < tasks.length; k++) {
+        if (task) {
+          if (task.done[k]) parts.push(k);
+        } else if (results[k]) {
+          parts.push(results[k]);
         }
-        srcP = Promise.all(fl);
-      } else {
-        srcP = Promise.resolve(results);
       }
-      return srcP.then(function (rs) {
-        var parts = rs.filter(function (x) { return x; });
-        if (parts.length !== tasks.length) throw new Error('有 ' + (tasks.length - parts.length) + ' 个分片缺失');
-        var totalBytes = 0;
-        for (var i = 0; i < parts.length; i++) totalBytes += parts[i].size || 0;
-        var tail = pl.endlist ? '' : '，直播流仅当前片段';
-        if (pl.hasDisc) {
-          // 多个不同 init 段/时间戳基准的 fMP4 拼成一个 MP4 必然错乱，宁可明确拒绝也别产出坏文件
-          if (pl.map) throw new Error('该流含 ' + (pl.discCount || 1) + ' 处拼接段，fMP4 合并会时间轴错乱；请用「录制当前画面」');
-          tail += '，含拼接段时间轴可能跳变';
-        }
+      if (parts.length !== tasks.length) throw new Error('有 ' + (tasks.length - parts.length) + ' 个分片缺失');
+      var tail = pl.endlist ? '' : '，直播流仅当前片段';
+      if (pl.hasDisc) {
+        // 多个不同 init 段/时间戳基准的 fMP4 拼成一个 MP4 必然错乱，宁可明确拒绝也别产出坏文件
+        if (pl.map) throw new Error('该流含 ' + (pl.discCount || 1) + ' 处拼接段，fMP4 合并会时间轴错乱；请用「录制当前画面」');
+        tail += '，含拼接段时间轴可能跳变';
+      }
 
-        function saveDl(blob, fname, msg) {
-          pg.close();
-          return dlPut(blob, fname).then(function (ent) {
-            var fin = task ? taskRemove(task.id) : Promise.resolve();
-            return fin.then(function () {
-              dlActive--;
-              renderDownloads();
-              if (!autoExportDl(ent)) toast('已存入下载管理：' + ent.name + '（' + msg + '）');
-            });
-          }, function (e) {
-            dlActive--;
-            toast(quotaHint(e));
+      function readOne(i) {
+        return task ? readPart(task.id, parts[i]) : Promise.resolve(parts[i]);
+      }
+
+      function finishDl(ent, msg) {
+        pg.close();
+        var fin = task ? taskRemove(task.id) : Promise.resolve();
+        return fin.then(function () {
+          dlActive--;
+          renderDownloads();
+          if (!autoExportDl(ent)) toast('已存入下载管理：' + ent.name + '（' + msg + '）');
+        });
+      }
+
+      if (pl.map) {
+        pg.set('正在合并 MP4…');
+        pg.sub('');
+        return streamConcatToDl(parts.length, readOne, name + '.mp4', 'video/mp4', function (cur, total) {
+          pg.progress(cur, total);
+        }).then(function (r) {
+          return finishDl(r.entry, THREADS + ' 线程' + tail);
+        });
+      }
+
+      // 无 OPFS 时结果全在内存，>300MB 转封装仍可能 OOM，直接存 TS；有 OPFS 时流式写盘，不设 300MB 上限
+      var memBytes = 0;
+      if (!dlDir) {
+        for (var mi = 0; mi < parts.length; mi++) memBytes += parts[mi].size || 0;
+        if (memBytes > 300 * 1024 * 1024) {
+          return dlPut(new Blob(parts, { type: 'video/mp2t' }), name + '.ts', 'video/mp2t').then(function (ent) {
+            return finishDl(ent, 'TS，VLC / MX 可播' + tail);
           });
         }
+      }
 
-        if (pl.map) {
-          if (!rs[0]) throw new Error('init 段下载失败，无法合并 MP4');
-          return saveDl(new Blob(parts, { type: 'video/mp4' }), name + '.mp4', THREADS + ' 线程' + tail);
-        }
+      pg.set('正在转封装为 MP4…');
+      pg.sub('');
+      if (dlDir) {
+        return dlInit().then(function () {
+          return dlBegin(name + '.mp4', 'video/mp4');
+        }).then(function (bt) {
+          return remuxToMp4(null, function (cur, total) { pg.progress(cur, total); }, {
+            count: parts.length,
+            readPart: readOne,
+            onChunk: function (u8) { return bt.write(u8); }
+          }).then(function (stat) {
+            if (!stat || stat.outBytes < stat.inBytes * 0.4) throw new Error('输出异常');
+            return bt.close().then(function () { return bt.finish(); });
+          }).then(function (ent) {
+            return finishDl(ent, THREADS + ' 线程' + tail);
+          }, function (err) {
+            return bt.fail().then(function () {
+              // 配额/写盘类错误直接向上报，不重复写一份 TS
+              if (err && (err.name === 'QuotaExceededError' || /quota|storage full|no space/i.test(String(err.message || '')))) throw err;
+              pg.set('转封装不可用，正在合并 TS…');
+              pg.sub('');
+              return streamConcatToDl(parts.length, readOne, name + '.ts', 'video/mp2t', function (cur, total) {
+                pg.progress(cur, total);
+              }).then(function (r) {
+                return finishDl(r.entry, 'TS，转封装不可用' + tail);
+              });
+            });
+          });
+        });
+      }
 
-        if (totalBytes > 300 * 1024 * 1024) {
-          return saveDl(new Blob(parts, { type: 'video/mp2t' }), name + '.ts', 'TS，VLC / MX 可播' + tail);
-        }
-
-        pg.set('正在转封装为 MP4…');
-        pg.sub('');
-        return remuxToMp4(parts, function (cur, total) { pg.progress(cur, total); }).then(function (blob) {
-          if (!blob || blob.size < totalBytes * 0.4) throw new Error('输出异常');
-          return saveDl(blob, name + '.mp4', THREADS + ' 线程' + tail);
-        }, function () {
-          return saveDl(new Blob(parts, { type: 'video/mp2t' }), name + '.ts', 'TS，转封装不可用' + tail);
+      return remuxToMp4(parts, function (cur, total) { pg.progress(cur, total); }).then(function (blob) {
+        if (!blob || blob.size < memBytes * 0.4) throw new Error('输出异常');
+        return dlPut(blob, name + '.mp4', 'video/mp4').then(function (ent) {
+          return finishDl(ent, THREADS + ' 线程' + tail);
+        });
+      }, function () {
+        return dlPut(new Blob(parts, { type: 'video/mp2t' }), name + '.ts', 'video/mp2t').then(function (ent) {
+          return finishDl(ent, 'TS，转封装不可用' + tail);
         });
       });
     }).catch(function (err) {
@@ -5548,7 +5850,9 @@
       }
       if (task) {
         taskFlush(true);
-        toast('下载中断：' + ((err && err.message) || '未知原因') + '，进度已保存可在下载管理继续');
+        toast((err && err.name === 'QuotaExceededError')
+          ? quotaHint(err)
+          : ('下载中断：' + ((err && err.message) || '未知原因') + '，进度已保存可在下载管理继续'));
         renderDownloads();
         return;
       }
@@ -5564,13 +5868,20 @@
   var recChunks = [];
   var recName = '';
 
+  function stopRecTracks(s) {
+    try {
+      var ts = s && s.getTracks ? s.getTracks() : [];
+      for (var i = 0; i < ts.length; i++) { try { ts[i].stop(); } catch (e) {} }
+    } catch (e) {}
+  }
+
   function startRecord() {
     if (recorder && recorder.state === 'recording') {
       recorder.stop();
       return;
     }
     var v = null;
-    var vs = collectVideos(document);
+    var vs = collectAllVideos();
     for (var i = 0; i < vs.length; i++) {
       if (!vs[i].paused && vs[i].videoWidth) { v = vs[i]; break; }
     }
@@ -5578,9 +5889,10 @@
     if (!v) { toast('没找到可录制的视频'); return; }
     if (!v.captureStream) { toast('当前内核不支持录制'); return; }
 
+    var stream = null;
     try {
-      var stream = v.captureStream();
-      if (!window.MediaRecorder) { toast('当前内核不支持录制'); return; }
+      stream = v.captureStream();
+      if (!window.MediaRecorder) { stopRecTracks(stream); toast('当前内核不支持录制'); return; }
       var CAND = ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm', 'video/mp4'];
       var mime = '';
       for (var ci = 0; ci < CAND.length; ci++) {
@@ -5593,21 +5905,32 @@
       var ext = outMime.indexOf('mp4') >= 0 ? '.mp4' : '.webm';
       recChunks = [];
       recName = sanitize(document.title || 'video') + ext;
+      function resetRecUI() {
+        recorder = null;
+        recChunks = [];
+        stopRecTracks(stream);
+        var btn = sheetEl && sheetEl.querySelector('[data-a="rec"]');
+        if (btn) btn.textContent = '录制当前画面';
+      }
       recorder.ondataavailable = function (e) {
         if (e.data && e.data.size) recChunks.push(e.data);
         var total = 0;
         for (var rj = 0; rj < recChunks.length; rj++) total += recChunks[rj].size;
         if (total > 120 * 1024 * 1024 && recorder && recorder.state === 'recording') recorder.stop();
       };
+      recorder.onerror = function (e) {
+        captureError('record', e);
+        resetRecUI();
+        toast('录制出错，已停止');
+      };
       recorder.onstop = function () {
         var blob = new Blob(recChunks, { type: outMime });
-        dlPut(blob, recName, outMime).then(function (ent) {
+        var nm = recName;
+        resetRecUI();
+        dlPut(blob, nm, outMime).then(function (ent) {
           renderDownloads();
           if (!autoExportDl(ent)) toast('录制已存入下载管理：' + ent.name);
         }, function () { toast('录制保存失败'); });
-        recorder = null;
-        var btn = sheetEl && sheetEl.querySelector('[data-a="rec"]');
-        if (btn) btn.textContent = '录制当前画面';
         closeSheet();
       };
       recorder.start(1000);
@@ -5615,6 +5938,9 @@
       if (recBtn) recBtn.textContent = '停止录制';
       toast('开始录制，再点一次结束（实时，别退出页面）');
     } catch (e) {
+      recChunks = [];
+      stopRecTracks(stream);
+      recorder = null;
       captureError('record', e);
       if (e && e.name === 'SecurityError') toast('视频跨域受保护，内核禁止录制画面');
       else toast('录制启动失败');
